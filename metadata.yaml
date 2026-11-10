@@ -1,0 +1,10 @@
+name: astrbot_plugin_image_library
+display_name: 图片收藏调用工具
+desc: 通过 QQ 和个人微信指令收藏、按标签与语义搜索并管理图片/视频，支持可配置的超限压缩、回收站、AI 描述与 NSFW 权限控制。
+version: 1.0.0
+author: Nyapoi
+repo: https://github.com/goblieve/astrbot_plugin_image_library
+support_platforms:
+  - aiocqhttp
+  - weixin_oc
+astrbot_version: ">=4.29.4,<5"

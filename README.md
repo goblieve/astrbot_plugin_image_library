@@ -75,5 +75,4 @@ NSFW 分类和媒体的聊天查看默认只允许 AstrBot 管理员或配置的
 
 ## 许可证
 
-本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
-
+本项目采用 GNU Affero 通用公共许可证第三版（GNU AGPL-3.0），详见 [LICENSE](LICENSE)。

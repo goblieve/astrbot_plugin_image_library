@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>图片与视频管理</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div>
+          <p class="eyebrow">ASTRBOT · QQ MEDIA LIBRARY</p>
+          <h1>图片与视频图集</h1>
+          <p class="subtitle">按分类整理、批量导入、移动和删除收藏媒体。</p>
+        </div>
+        <button class="button secondary" id="refreshButton" type="button">刷新</button>
+      </header>
+
+      <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+
+      <section class="panel toolbar" id="activeToolbar" aria-label="图集操作">
+        <label class="category-picker">
+          <span>当前分类</span>
+          <select id="categorySelect" aria-label="选择媒体分类"></select>
+        </label>
+        <div class="toolbar-actions">
+          <button class="button secondary" id="createCategoryButton" type="button">新建分类</button>
+          <button class="button secondary danger-text" id="deleteCategoryButton" type="button">删除分类</button>
+          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/bmp,video/mp4,video/quicktime,video/3gpp,video/x-msvideo,video/x-matroska,video/webm,.mp4,.mov,.3gp,.avi,.mkv,.webm" multiple hidden />
+          <button class="button primary" id="uploadButton" type="button">批量导入</button>
+        </div>
+        <p class="hint toolbar-hint">支持 JPG、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM；重复文件会自动跳过。多文件按顺序导入。</p>
+      </section>
+
+      <section class="panel search-panel" id="activeSearchPanel" aria-label="语义检索与 NSFW 评估">
+        <div class="search-heading">
+          <div>
+            <h2>AI 描述与语义检索</h2>
+            <p class="hint">媒体导入或收藏到普通分类后自动评估；“待处理”视为未分类，不自动发送。NSFW 媒体仅在你选定模型并手动提交后评估。管理页语义检索会同时搜索已建立索引的 SFW 与 NSFW 媒体。</p>
+          </div>
+        </div>
+        <div class="search-controls">
+          <label class="semantic-query">语义描述
+            <input id="semanticQueryInput" class="text-input" maxlength="500" placeholder="例如：夕阳下的海边，人物穿着白色连衣裙" />
+          </label>
+          <button class="button primary" id="semanticSearchButton" type="button">语义检索</button>
+          <button class="button secondary" id="clearSearchButton" type="button" hidden>返回分类</button>
+        </div>
+        <div class="nsfw-evaluation-row" id="nsfwEvaluationRow" hidden>
+          <label class="provider-picker">NSFW 人工评估模型
+            <select id="nsfwProviderSelect" aria-label="选择 NSFW 人工评估模型"></select>
+          </label>
+          <span class="hint">所选媒体和抽帧会发送给此模型。只会评估已标记 NSFW 的媒体。</span>
+        </div>
+        <div class="active-tag-filter" id="activeTagFilter" hidden>
+          <span id="activeTagFilterLabel"></span>
+          <button class="button secondary" id="clearTagFilterButton" type="button">清除标签筛选</button>
+        </div>
+        <p class="hint" id="aiProviderSummary">正在读取模型配置…</p>
+        <p class="hint privacy-note">SFW 媒体评估会将图片或视频抽帧发送给插件配置中选定的模型；NSFW 不会自动发送。语义检索会将文字查询发送给所选 Embedding 服务。</p>
+        <div class="index-rebuild-row">
+          <span class="hint">按范围重建已有描述和 AI 标签的语义索引：</span>
+          <button class="button secondary" id="rebuildSfwIndexButton" type="button">重建 SFW 索引</button>
+          <button class="button secondary" id="rebuildNsfwIndexButton" type="button">重建 NSFW 索引</button>
+          <span class="hint" id="reindexStatus" aria-live="polite"></span>
+        </div>
+        <p class="hint">重建会将对应范围的文字描述和 AI 标签发送给当前 Embedding 提供商；不会调用视觉评估模型。</p>
+      </section>
+
+      <section class="panel gallery-panel" aria-label="媒体列表">
+        <div class="gallery-heading">
+          <div>
+            <h2 id="galleryTitle">媒体</h2>
+            <p class="hint" id="gallerySummary">正在读取分类…</p>
+          </div>
+          <div class="selection-actions" id="activeSelectionActions">
+            <button class="button secondary" id="selectAllButton" type="button">全选本页</button>
+            <button class="button secondary" id="invertSelectionButton" type="button">反选本页</button>
+            <button class="button secondary" id="clearSelectionButton" type="button" disabled>取消选择</button>
+            <span class="selected-count" id="selectedCount">已选 0 项</span>
+            <button class="button secondary" id="editTagsButton" type="button" disabled>维护标签</button>
+            <button class="button secondary" id="evaluateSfwSelectedButton" type="button" disabled>评估所选 SFW 媒体</button>
+            <button class="button secondary" id="evaluateSelectedButton" type="button" disabled>人工评估所选 NSFW 媒体</button>
+            <label class="move-target-label">移动到
+              <select id="moveTargetSelect" aria-label="选择移动目标分类"></select>
+            </label>
+            <button class="button secondary" id="moveImagesButton" type="button" disabled>移动所选</button>
+            <div class="trash-button-group">
+              <button class="button secondary" id="openTrashButton" type="button">回收站</button>
+              <button class="button danger" id="deleteImagesButton" type="button" disabled>移入回收站</button>
+            </div>
+          </div>
+          <div class="selection-actions trash-actions" id="trashActions" hidden>
+            <button class="button secondary" id="trashBackButton" type="button">返回图集</button>
+            <button class="button secondary" id="trashSelectAllButton" type="button">全选本页</button>
+            <button class="button secondary" id="trashInvertSelectionButton" type="button">反选本页</button>
+            <button class="button secondary" id="trashClearSelectionButton" type="button" disabled>取消选择</button>
+            <span class="selected-count" id="trashSelectedCount">已选 0 项</span>
+            <button class="button secondary" id="restoreTrashSelectedButton" type="button" disabled>还原所选</button>
+            <button class="button danger" id="purgeTrashSelectedButton" type="button" disabled>彻底删除所选</button>
+            <button class="button danger" id="emptyTrashButton" type="button" disabled>清空回收站</button>
+          </div>
+        </div>
+        <div id="imageGrid" class="image-grid" aria-live="polite"></div>
+        <div class="empty-state" id="emptyState" hidden>
+          <div class="empty-icon">▧</div>
+            <strong>这个分类还没有媒体</strong>
+          <span>可以从聊天指令收藏图片或视频，或在这里批量导入。</span>
+        </div>
+        <footer class="pagination">
+          <span id="pageSummary">第 1 页</span>
+          <div>
+            <button class="button secondary" id="previousPageButton" type="button">上一页</button>
+            <button class="button secondary" id="nextPageButton" type="button">下一页</button>
+          </div>
+        </footer>
+      </section>
+
+      <p class="footer-note">“待处理”是媒体归档分类，不可删除。删除的媒体会先进入回收站，并在服务器本地时间每日 0 点自动清空。</p>
+    </main>
+
+    <div class="modal-backdrop" id="categoryModal" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <form id="categoryForm">
+          <div class="modal-heading">
+            <div>
+              <p class="eyebrow">NEW CATEGORY</p>
+              <h2 id="modalTitle">新建分类</h2>
+            </div>
+            <button class="icon-button" id="closeModalButton" type="button" aria-label="关闭">×</button>
+          </div>
+          <label class="field-label" for="categoryNameInput">分类名称</label>
+          <input id="categoryNameInput" class="text-input" maxlength="32" autocomplete="off" placeholder="例如：旅行" required />
+          <label class="check-row"><input id="categoryNsfwInput" type="checkbox" /> 标记为 NSFW 分类</label>
+          <p class="hint">名称不能包含空格，最多 32 个字符。</p>
+          <div class="modal-actions">
+            <button class="button secondary" id="cancelModalButton" type="button">取消</button>
+            <button class="button primary" type="submit">创建分类</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="confirmModal" hidden>
+      <section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <p class="eyebrow">CONFIRM ACTION</p>
+        <h2 id="confirmTitle">确认删除？</h2>
+        <p id="confirmMessage">删除后无法恢复。</p>
+        <div class="modal-actions">
+          <button class="button secondary" id="cancelConfirmButton" type="button">取消</button>
+          <button class="button danger" id="acceptConfirmButton" type="button">确认删除</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="tagsModal" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="tagsModalTitle">
+        <form id="tagsForm">
+          <div class="modal-heading">
+            <div>
+              <p class="eyebrow">MEDIA TAGS</p>
+              <h2 id="tagsModalTitle">维护标签</h2>
+            </div>
+            <button class="icon-button" id="closeTagsModalButton" type="button" aria-label="关闭">×</button>
+          </div>
+          <label class="field-label" for="tagModeSelect">维护方式</label>
+          <select id="tagModeSelect">
+            <option value="replace">替换手工标签</option>
+            <option value="add">追加标签</option>
+            <option value="remove">移除指定标签</option>
+          </select>
+          <label class="field-label tags-input-label" for="tagsInput">标签</label>
+          <input id="tagsInput" class="text-input" maxlength="1000" autocomplete="off" placeholder="例如：海边, 夕阳, 白色连衣裙" />
+          <p class="hint">用逗号分隔，单个标签最多 32 字，每个媒体最多 30 个手工标签。AI 标签单独保留。</p>
+          <div class="modal-actions">
+            <button class="button secondary" id="cancelTagsModalButton" type="button">取消</button>
+            <button class="button primary" type="submit">保存标签</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="detailModal" hidden>
+      <section class="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+        <form id="detailForm">
+          <div class="modal-heading">
+            <div>
+              <p class="eyebrow">MEDIA DETAILS</p>
+              <h2 id="detailTitle">媒体详情</h2>
+            </div>
+            <button class="icon-button" id="closeDetailModalButton" type="button" aria-label="关闭">×</button>
+          </div>
+          <div class="detail-preview" id="detailPreview"></div>
+          <div class="detail-ai-tags">
+            <div class="detail-ai-toolbar">
+              <span class="field-label">AI 标签（点击 × 移除误识别标签）</span>
+              <button class="button danger" id="clearAiEvaluationButton" type="button">清空 AI 描述和标签</button>
+            </div>
+            <p class="hint" id="clearAiEvaluationHint">清空时也会移除手动描述覆盖，保留手工标签；保存后可重新评估。</p>
+            <div class="tag-list" id="detailAiTags"></div>
+          </div>
+          <label class="field-label" for="detailDescriptionInput">描述（可手动编辑）</label>
+          <textarea id="detailDescriptionInput" class="text-input detail-description-input" maxlength="3000" placeholder="暂无描述；可在这里补充描述。"></textarea>
+          <label class="field-label detail-tags-label" for="detailManualTagInput">手工标签</label>
+          <div class="manual-tag-input-row">
+            <input id="detailManualTagInput" class="text-input" maxlength="64" autocomplete="off" placeholder="输入标签，可包含 emoji" />
+            <button class="button secondary" id="addDetailManualTagButton" type="button">添加</button>
+          </div>
+          <div class="tag-list detail-manual-tags" id="detailManualTagsList"></div>
+          <p class="hint" id="detailManualTagsHint">按 Enter 或点击“添加”保存标签；每个标签最多 32 个字符，每个媒体最多保留 30 个手工标签。AI 标签与手工标签分开保存。</p>
+          <p class="hint">保存描述或标签后会尝试更新语义索引（如果已配置 Embedding 模型）。</p>
+          <div class="modal-actions">
+            <button class="button secondary" id="cancelDetailModalButton" type="button">取消</button>
+            <button class="button primary" type="submit">保存详情</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </body>
+</html>

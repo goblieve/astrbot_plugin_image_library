@@ -1,0 +1,81 @@
+{
+  "compress_oversized_media": {
+    "description": "超出入库体积上限时自动压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时，超过图片或视频入库体积上限的文件会尝试压缩；关闭时直接拒收。原始文件接收上限始终生效。"
+  },
+  "max_image_size_mb": {
+    "description": "图片入库体积上限（MB）",
+    "type": "int",
+    "default": 20,
+    "hint": "可设 1–100 MB。启用超限压缩时，超出上限的静态图片会尝试压缩为 JPEG/WebP；超大 JPEG 会先请求半尺寸解码降采样。当前像素上限为 1.6 亿，超大非 JPEG 图片或超出安全像素上限的动图可能需要先缩小。关闭超限压缩时，超过上限的图片会拒收。"
+  },
+  "max_video_size_mb": {
+    "description": "视频入库体积上限（MB）",
+    "type": "int",
+    "default": 100,
+    "hint": "可设 1–100 MB。启用超限压缩时，超出上限的视频会尝试使用 FFmpeg 转码为 H.264/AAC MP4；压缩失败时不会入库。关闭超限压缩时，超过上限的视频会拒收。"
+  },
+  "max_source_image_size_mb": {
+    "description": "图片原始文件接收上限（MB，最高 500）",
+    "type": "int",
+    "default": 200,
+    "hint": "为压缩留出的原始上传上限；超过此值会在压缩前拒收。实际生效值不会低于图片入库目标。"
+  },
+  "max_source_video_size_mb": {
+    "description": "视频原始文件接收上限（MB，最高 1000）",
+    "type": "int",
+    "default": 500,
+    "hint": "为压缩留出的原始上传上限；超过此值会在压缩前拒收。实际生效值不会低于视频入库目标。超限视频压缩需要 FFmpeg。"
+  },
+  "sfw_evaluation_provider_id": {
+    "description": "SFW 图片与视频视觉评估模型",
+    "type": "string",
+    "default": "",
+    "hint": "选择已启用且支持图片输入的聊天模型。SFW 媒体收藏或导入后会自动发送给该模型生成描述和标签；视频会发送最多 3 张抽帧。留空时自动评估会显示未配置。",
+    "_special": "select_provider"
+  },
+  "nsfw_evaluation_provider_id": {
+    "description": "NSFW 人工评估默认模型",
+    "type": "string",
+    "default": "",
+    "hint": "选择已启用且支持图片输入的聊天模型，供 NSFW 后台人工评估默认使用。NSFW 媒体仍不会自动发送；管理页面可在提交评估时改选其他聊天模型。",
+    "_special": "select_provider"
+  },
+  "sfw_evaluation_prompt": {
+    "description": "SFW 自定义评估提示词",
+    "type": "text",
+    "default": "你是媒体图集的视觉标注器。请用简洁中文概括可见主体、场景、动作和风格，并给出 3 到 12 个简短、可检索的中文标签。这是普通 SFW 媒体。只描述画面中可见内容，不推断人物身份、年龄、出处或画外情节。{{media_context}}只输出合法 JSON，不要 Markdown，格式为：{\"description\":\"...\",\"tags\":[\"...\", \"...\"]}。",
+    "hint": "此内容会完整替代插件内置 SFW 提示词，不会与其拼接。默认值是当前提示词。可选占位符 {{media_context}} 会替换为图片或视频抽帧说明；删除占位符后不会额外注入说明。若需要 AI 标签，请保留 JSON 输出要求。"
+  },
+  "nsfw_evaluation_prompt": {
+    "description": "NSFW 自定义评估提示词",
+    "type": "text",
+    "default": "你是媒体图集的视觉标注器。请用简洁中文概括可见主体、场景、动作和风格，并给出 3 到 12 个简短、可检索的中文标签。这是管理员在后台明确选择后提交的 NSFW 媒体。仅作中性、客观的视觉描述，不进行露骨扩写，不推断人物身份、年龄或出处。{{media_context}}只输出合法 JSON，不要 Markdown，格式为：{\"description\":\"...\",\"tags\":[\"...\", \"...\"]}。",
+    "hint": "此内容会完整替代插件内置 NSFW 提示词，不会与其拼接。默认值是当前提示词。可选占位符 {{media_context}} 会替换为图片或视频抽帧说明；删除占位符后不会额外注入说明。若需要 AI 标签，请保留 JSON 输出要求。"
+  },
+  "embedding_provider_id": {
+    "description": "语义检索 Embedding 模型",
+    "type": "string",
+    "default": "",
+    "hint": "选择 AstrBot 已启用的 Embedding 提供商。语义检索需要它将描述与查询转换为向量；切换模型后，可在图集管理页按 SFW/NSFW 范围批量重建索引。",
+    "_special": "select_provider:embedding"
+  },
+  "nsfw_allowed_users": {
+    "description": "允许在聊天中查看 NSFW 分类的 QQ 用户号或个人微信发送者 ID；留空时仅 AstrBot 管理员可查看",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "nsfw_allowed_groups": {
+    "description": "允许查看 NSFW 分类的 QQ 群号；群内所有成员均可查看，留空时仅 AstrBot 管理员可查看",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  }
+}
