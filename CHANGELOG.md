@@ -1,27 +1,27 @@
-# Changelog
+# 更新日志
 
-All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses Semantic Versioning.
+本文件记录项目的重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循语义化版本规范。
 
 ## [1.1.3] - 2026-11-10
 
-### Added
+### 新增
 
-- Added a persistent AI processing task center for media compression, video preview generation, AI evaluation, and semantic indexing, with task progress, status, error details, retry, and cancellation.
-- Recorded the model ID, prompt hash, and timestamps for AI evaluations. Added stale-evaluation detection so only content evaluated with an older model or prompt needs reassessment; NSFW reassessment remains a manual, model-selected action.
-- Added tag aliases and optional parent-child tag relationships, manual and batch tag maintenance, fuzzy tag search with the 搜图 command, and semantic search.
-- Added cross-category duplicate checks for exact matches and visually similar images.
-- Added a recycle bin with restore and permanent-delete controls, plus scheduled daily cleanup.
-- Added personal WeChat (weixin_oc) support and unified image/video collection, browsing, and category storage.
-- Added configurable handling for oversized uploads, including optional automatic compression and chunked WebUI uploads for large media.
+- 新增持久化 AI 处理任务中心，集中查看媒体压缩、视频预览生成、AI 评估和语义索引任务的进度、状态及失败原因，并支持重试和取消。
+- 记录每次 AI 评估所用的模型 ID、提示词哈希版本和任务时间；模型或提示词变更后可识别过期评估。NSFW 过期内容仍需手动选择模型并确认重评。
+- 新增标签别名和可选父子层级，支持手动及批量维护标签、模糊标签搜索指令“搜图”和语义搜索。
+- 新增跨分类重复项检查，可识别文件完全相同的媒体和视觉相似图片。
+- 新增媒体回收站，支持还原、彻底删除和每日自动清理。
+- 新增个人微信（weixin_oc）适配，并支持图片与视频共同收藏、浏览和分类管理。
+- 新增超大文件处理配置，可选择拒收超限文件或启用自动压缩；WebUI 支持分块上传大文件。
 
-### Changed
+### 变更
 
-- Updated chat commands so most commands no longer require the 图集 prefix; retained 图集 帮助 and 图集 删除.
-- Added separate SFW and NSFW evaluation model and prompt settings. SFW media can be evaluated automatically; NSFW media requires a manual selection and confirmation.
-- Expanded WebUI bulk operations for media import, category moves, selection, and management.
+- 调整聊天指令：除“图集 帮助”和“图集 删除”外，其余指令不再要求添加“图集”前缀。
+- SFW 与 NSFW 分别配置评估模型和提示词；SFW 媒体可自动评估，NSFW 媒体需在后台手动选择模型并确认。
+- 扩展 WebUI 批量操作，支持批量导入、标签维护、跨分类移动和媒体管理。
 
-### Fixed
+### 修复
 
-- Placed reassessment confirmation dialogs above the AI processing task center so they remain visible while the task center is open.
-- Improved large-media import and compression handling, and made task progress reflect completion of the full ingest operation rather than compression alone.
-- Prevented cancellation of one semantic-index task from cancelling the rest of a batch.
+- 调整重评确认弹窗的显示层级，使其在 AI 处理任务中心打开时仍可见。
+- 改进大文件导入与压缩处理；压缩进度完成后，只有完整入库流程成功才会把任务标记为成功。
+- 修复取消单个语义索引任务时可能连带取消整批索引任务的问题。
