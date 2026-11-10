@@ -146,6 +146,13 @@ def build_evaluation_prompt(custom_prompt: str, media_type: str) -> str:
     return prompt.replace("{{media_context}}", media_context)
 
 
+def evaluation_prompt_version(custom_prompt: str) -> str:
+    """Return a stable, non-reversible identifier for an evaluation prompt."""
+    normalized = str(custom_prompt or "").strip()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
 class MediaAI:
     def __init__(
         self,
@@ -167,6 +174,7 @@ class MediaAI:
         scope: str,
         chat_provider_id: str,
         embedding_provider_id: str = "",
+        force: bool = False,
     ) -> dict[str, Any]:
         chat_provider_id = str(chat_provider_id or "").strip()
         if not chat_provider_id:
@@ -174,9 +182,10 @@ class MediaAI:
         media = await asyncio.to_thread(
             self.store.get_media_for_evaluation, int(image_id), scope
         )
-        if str(media.get("description_override") or "").strip() or str(
-            media.get("ai_description") or ""
-        ).strip():
+        if not force and (
+            str(media.get("description_override") or "").strip()
+            or str(media.get("ai_description") or "").strip()
+        ):
             return {"image_id": int(image_id), "scope": scope, "skipped": True}
         await asyncio.to_thread(
             self.store.set_ai_status,
@@ -233,32 +242,10 @@ class MediaAI:
             if frames:
                 self.store.cleanup_video_frames(frames)
 
-        indexed = False
-        embedding_provider_id = str(embedding_provider_id or "").strip()
-        if embedding_provider_id:
-            try:
-                provider = self.context.get_provider_by_id(embedding_provider_id)
-                if not provider:
-                    raise GalleryError("Embedding 提供商当前不可用。")
-                searchable_text = "\n".join(
-                    part for part in (description, " ".join(tags)) if part
-                )
-                vector = await create_embedding(provider, searchable_text)
-                fingerprint = embedding_fingerprint(provider, embedding_provider_id)
-                await asyncio.to_thread(
-                    self.store.save_embedding,
-                    int(image_id),
-                    scope,
-                    embedding_provider_id,
-                    fingerprint,
-                    vector,
-                )
-                indexed = True
-            except Exception as exc:
-                self.logger.warning(
-                    "图集媒体 %s 描述已保存，但语义向量生成失败：%s",
-                    image_id,
-                    exc,
-                )
-        return {"image_id": int(image_id), "scope": scope, "indexed": indexed}
+        return {
+            "image_id": int(image_id),
+            "scope": scope,
+            "description": description,
+            "tags": tags,
+        }
 

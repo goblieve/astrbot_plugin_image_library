@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import shutil
@@ -23,8 +24,9 @@ from .ai import (
     MediaAI,
     create_embedding,
     embedding_fingerprint,
+    evaluation_prompt_version,
 )
-from .store import GalleryError, GalleryStore
+from .store import GalleryError, GalleryStore, ProcessingTaskCancelled
 
 
 PLUGIN_NAME = "astrbot_plugin_image_library"
@@ -56,6 +58,7 @@ class ImageLibraryPlugin(Star):
             max_source_image_size_mb=max_source_image_size_mb,
             max_source_video_size_mb=max_source_video_size_mb,
         )
+        self.store.mark_interrupted_processing_tasks()
         self.sfw_evaluation_provider_id = str(
             config.get("sfw_evaluation_provider_id", "") or ""
         ).strip()
@@ -86,9 +89,16 @@ class ImageLibraryPlugin(Star):
         self._web_upload_stopping = False
         self._ai_tasks: set[asyncio.Task] = set()
         self._ai_queued_ids: set[tuple[str, int]] = set()
+        self._processing_tasks: dict[str, asyncio.Task] = {}
+        self._processing_task_keys: dict[tuple[str, int], str] = {}
+        self._embedding_semaphore = asyncio.Semaphore(1)
+        self._video_preview_semaphore = asyncio.Semaphore(1)
         self._trash_cleanup_task: asyncio.Task | None = None
         self._embedding_job: dict | None = None
         self._embedding_job_task: asyncio.Task | None = None
+        self._duplicate_job: dict | None = None
+        self._duplicate_job_task: asyncio.Task | None = None
+        self._duplicate_scan_results: dict | None = None
         self._register_web_apis()
         logger.info(f"{PLUGIN_NAME} 已就绪，数据目录：{self.data_dir}")
 
@@ -111,8 +121,21 @@ class ImageLibraryPlugin(Star):
             (f"/{PLUGIN_NAME}/trash/empty", self.web_empty_trash, ["POST"], "Empty media trash"),
             (f"/{PLUGIN_NAME}/images/move", self.web_move_images, ["POST"], "Move selected media to another category"),
             (f"/{PLUGIN_NAME}/images/tags", self.web_update_tags, ["POST"], "Maintain media tags"),
+            (f"/{PLUGIN_NAME}/tags/taxonomy", self.web_tag_taxonomy, ["GET"], "List tag aliases and hierarchy"),
+            (f"/{PLUGIN_NAME}/tags/aliases/save", self.web_save_tag_alias, ["POST"], "Create or update a tag alias"),
+            (f"/{PLUGIN_NAME}/tags/aliases/delete", self.web_delete_tag_alias, ["POST"], "Delete a tag alias"),
+            (f"/{PLUGIN_NAME}/tags/hierarchy/save", self.web_save_tag_parent, ["POST"], "Create or update a tag parent"),
+            (f"/{PLUGIN_NAME}/tags/hierarchy/delete", self.web_delete_tag_parent, ["POST"], "Delete a tag parent"),
+            (f"/{PLUGIN_NAME}/tags/normalize/preview", self.web_preview_tag_normalization, ["POST"], "Preview explicit tag normalization"),
+            (f"/{PLUGIN_NAME}/tags/normalize/apply", self.web_apply_tag_normalization, ["POST"], "Apply confirmed tag normalization"),
             (f"/{PLUGIN_NAME}/images/details", self.web_update_media_details, ["POST"], "Edit media description and tags"),
+            (f"/{PLUGIN_NAME}/duplicates/scan", self.web_duplicates_scan, ["POST"], "Scan cross-category exact duplicates and similar images"),
+            (f"/{PLUGIN_NAME}/duplicates/status", self.web_duplicates_status, ["GET"], "Read duplicate scan progress"),
+            (f"/{PLUGIN_NAME}/duplicates/results", self.web_duplicates_results, ["GET"], "List duplicate scan results"),
             (f"/{PLUGIN_NAME}/ai/providers", self.web_ai_providers, ["GET"], "List available AI providers"),
+            (f"/{PLUGIN_NAME}/tasks", self.web_processing_tasks, ["GET"], "List media processing tasks"),
+            (f"/{PLUGIN_NAME}/tasks/action", self.web_processing_task_action, ["POST"], "Retry or cancel a media processing task"),
+            (f"/{PLUGIN_NAME}/tasks/reassess", self.web_reassess_stale_media, ["POST"], "Re-evaluate media with stale prompt or model versions"),
             (f"/{PLUGIN_NAME}/ai/evaluate", self.web_ai_evaluate, ["POST"], "Evaluate selected media"),
             (f"/{PLUGIN_NAME}/ai/search", self.web_ai_search, ["POST"], "Search media by semantic similarity"),
             (f"/{PLUGIN_NAME}/ai/reindex", self.web_ai_reindex, ["POST"], "Rebuild semantic embeddings by safety scope"),
@@ -143,39 +166,122 @@ class ImageLibraryPlugin(Star):
         )
 
     def _schedule_ai_evaluation(
-        self, image_id: int, scope: str, provider_id: str = ""
-    ) -> None:
+        self,
+        image_id: int,
+        scope: str,
+        provider_id: str = "",
+        *,
+        force: bool = False,
+        batch_id: str = "",
+        retry_of: str = "",
+    ) -> str | None:
         key = (scope, int(image_id))
-        if key in self._ai_queued_ids:
-            return
+        existing_id = self._processing_task_keys.get(("ai_evaluation", int(image_id)))
+        existing = self._processing_tasks.get(existing_id or "")
+        if existing_id and existing and not existing.done():
+            return None if force or batch_id else existing_id
         self._ai_queued_ids.add(key)
-        task = asyncio.create_task(
-            self._run_ai_evaluation(image_id, scope, provider_id),
-            name=f"{PLUGIN_NAME}-ai-{scope}-{image_id}",
-        )
-        self._ai_tasks.add(task)
-        task.add_done_callback(lambda completed, task_key=key: self._finish_ai_task(completed, task_key))
-
-    def _finish_ai_task(self, task: asyncio.Task, key: tuple[str, int]) -> None:
-        self._ai_tasks.discard(task)
-        self._ai_queued_ids.discard(key)
-
-    async def _run_ai_evaluation(
-        self, image_id: int, scope: str, provider_id: str = ""
-    ) -> None:
         chosen_provider_id = provider_id or (
             self.nsfw_evaluation_provider_id
             if scope == "nsfw"
             else self.sfw_evaluation_provider_id
         )
+        prompt = self.media_ai.nsfw_evaluation_prompt if scope == "nsfw" else self.media_ai.sfw_evaluation_prompt
+        task_id = self.store.create_processing_task(
+            "ai_evaluation",
+            media_id=int(image_id),
+            scope=scope,
+            model_id=chosen_provider_id,
+            prompt_version=evaluation_prompt_version(prompt),
+            batch_id=batch_id,
+            retry_of=retry_of,
+            metadata={"force": bool(force)},
+            message="等待视觉评估模型",
+        )
+        task = asyncio.create_task(
+            self._run_ai_evaluation(task_id, image_id, scope, chosen_provider_id, force),
+            name=f"{PLUGIN_NAME}-ai-{scope}-{image_id}-{task_id[:8]}",
+        )
+        self._ai_tasks.add(task)
+        self._processing_tasks[task_id] = task
+        self._processing_task_keys[("ai_evaluation", int(image_id))] = task_id
+        task.add_done_callback(
+            lambda completed, processing_id=task_id, processing_key=("ai_evaluation", int(image_id)), ai_key=key:
+                self._finish_processing_task(completed, processing_id, processing_key, ai_key)
+        )
+        return task_id
+
+    def _finish_processing_task(
+        self,
+        task: asyncio.Task,
+        task_id: str,
+        processing_key: tuple[str, int] | None = None,
+        ai_key: tuple[str, int] | None = None,
+    ) -> None:
+        self._processing_tasks.pop(task_id, None)
+        if processing_key is not None:
+            if self._processing_task_keys.get(processing_key) == task_id:
+                self._processing_task_keys.pop(processing_key, None)
+        if ai_key is not None:
+            self._ai_tasks.discard(task)
+            self._ai_queued_ids.discard(ai_key)
+        try:
+            row = self.store.get_processing_task(task_id)
+        except Exception:
+            row = None
+        if row and row.get("status") in {"queued", "running"}:
+            try:
+                self.store.update_processing_task(
+                    task_id,
+                    status="failed",
+                    error="任务意外退出。",
+                    message="任务意外退出，可从任务中心重试。",
+                )
+            except Exception:
+                pass
+
+    async def _run_ai_evaluation(
+        self,
+        task_id: str,
+        image_id: int,
+        scope: str,
+        provider_id: str = "",
+        force: bool = False,
+    ) -> None:
         try:
             async with self._evaluation_semaphore:
-                await self.media_ai.evaluate(
+                self.store.update_processing_task(
+                    task_id,
+                    status="running",
+                    progress=5,
+                    message="正在请求视觉模型",
+                )
+                result = await self.media_ai.evaluate(
                     image_id,
                     scope,
-                    chosen_provider_id,
-                    self.embedding_provider_id,
+                    provider_id,
+                    force=force,
                 )
+                if result.get("skipped"):
+                    self.store.update_processing_task(
+                        task_id,
+                        status="skipped",
+                        progress=100,
+                        message="媒体已有描述或手动描述，已跳过",
+                    )
+                    return
+                self.store.update_processing_task(
+                    task_id,
+                    status="succeeded",
+                    progress=100,
+                    message="描述和 AI 标签已保存",
+                )
+                if self.embedding_provider_id:
+                    self._schedule_embedding_task(
+                        image_id,
+                        scope,
+                        self.embedding_provider_id,
+                    )
         except asyncio.CancelledError:
             try:
                 await asyncio.to_thread(
@@ -183,8 +289,17 @@ class ImageLibraryPlugin(Star):
                     image_id,
                     scope,
                     "failed",
-                    "评估任务被插件重载中断，请重新提交。",
-                    chosen_provider_id,
+                    "评估任务已取消，可从任务中心重试。",
+                    provider_id,
+                )
+            except Exception:
+                pass
+            try:
+                self.store.update_processing_task(
+                    task_id,
+                    status="cancelled",
+                    error="任务已取消。",
+                    message="已取消",
                 )
             except Exception:
                 pass
@@ -198,10 +313,143 @@ class ImageLibraryPlugin(Star):
                     scope,
                     "failed",
                     str(exc),
-                    chosen_provider_id,
+                    provider_id,
                 )
             except Exception:
                 pass
+            self.store.update_processing_task(
+                task_id,
+                status="failed",
+                error=str(exc),
+                message="视觉评估失败，可从任务中心重试",
+            )
+
+    def _schedule_embedding_task(
+        self,
+        image_id: int,
+        scope: str,
+        provider_id: str,
+        *,
+        batch_id: str = "",
+        retry_of: str = "",
+    ) -> str | None:
+        key = ("semantic_index", int(image_id))
+        existing_id = self._processing_task_keys.get(key)
+        existing = self._processing_tasks.get(existing_id or "")
+        if existing_id and existing and not existing.done():
+            return None if batch_id else existing_id
+        task_id = self.store.create_processing_task(
+            "semantic_index",
+            media_id=int(image_id),
+            scope=scope,
+            model_id=provider_id,
+            batch_id=batch_id,
+            retry_of=retry_of,
+            metadata={},
+            message="等待 Embedding 服务",
+        )
+        task = asyncio.create_task(
+            self._run_embedding_task(
+                task_id,
+                int(image_id),
+                scope,
+                provider_id,
+            ),
+            name=f"{PLUGIN_NAME}-embedding-{scope}-{image_id}-{task_id[:8]}",
+        )
+        self._processing_tasks[task_id] = task
+        self._processing_task_keys[key] = task_id
+        task.add_done_callback(
+            lambda completed, processing_id=task_id, processing_key=key:
+                self._finish_processing_task(completed, processing_id, processing_key)
+        )
+        return task_id
+
+    async def _run_embedding_task(
+        self,
+        task_id: str,
+        image_id: int,
+        scope: str,
+        provider_id: str,
+    ) -> None:
+        try:
+            async with self._embedding_semaphore:
+                self.store.update_processing_task(
+                    task_id,
+                    status="running",
+                    progress=10,
+                    message="正在读取媒体描述并连接 Embedding 服务",
+                )
+                if self.store.processing_task_cancel_requested(task_id):
+                    raise asyncio.CancelledError()
+                searchable_text = await asyncio.to_thread(
+                    self.store.embedding_text_for_media,
+                    image_id,
+                    scope,
+                )
+                provider = self.context.get_provider_by_id(provider_id)
+                if not provider:
+                    raise GalleryError("Embedding 提供商当前不可用。")
+                self.store.update_processing_task(
+                    task_id, progress=35, message="正在生成语义向量"
+                )
+                vector = await create_embedding(provider, searchable_text)
+                if self.store.processing_task_cancel_requested(task_id):
+                    raise asyncio.CancelledError()
+                latest_text = await asyncio.to_thread(
+                    self.store.embedding_text_for_media,
+                    image_id,
+                    scope,
+                )
+                if latest_text != searchable_text:
+                    raise GalleryError("媒体描述或标签在建索引期间发生变化，请重试该索引任务。")
+                fingerprint = embedding_fingerprint(provider, provider_id)
+                await asyncio.to_thread(
+                    self.store.save_embedding,
+                    image_id,
+                    scope,
+                    provider_id,
+                    fingerprint,
+                    vector,
+                )
+                self.store.update_processing_task(
+                    task_id,
+                    status="succeeded",
+                    progress=100,
+                    message="语义索引已建立",
+                )
+        except asyncio.CancelledError:
+            self.store.update_processing_task(
+                task_id,
+                status="cancelled",
+                error="语义索引任务已取消。",
+                message="已取消",
+            )
+            raise
+        except Exception as exc:
+            logger.warning(f"语义索引失败（媒体 {image_id}）：{exc}")
+            self.store.update_processing_task(
+                task_id,
+                status="failed",
+                error=str(exc),
+                message="语义索引失败，可从任务中心重试",
+            )
+
+    async def _run_embedding_batch(self, job: dict, tasks: list[asyncio.Task]) -> None:
+        try:
+            # A task-center cancellation applies to one media item. Do not let
+            # gather propagate that child's CancelledError and cancel the rest
+            # of the reindex batch.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            summary = self.store.processing_task_batch_summary(job["job_id"])
+            job.update(summary)
+            job["status"] = "completed"
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            job["status"] = "cancelled"
+            raise
 
     async def initialize(self):
         self._trash_cleanup_task = asyncio.create_task(
@@ -229,14 +477,22 @@ class ImageLibraryPlugin(Star):
 
     async def terminate(self):
         self._web_upload_stopping = True
+        try:
+            await asyncio.to_thread(
+                self.store.request_cancel_all_active_processing_tasks
+            )
+        except Exception:
+            pass
         for upload_id, session in list(self._web_upload_sessions.items()):
             self._clear_web_upload_session(upload_id, session)
         self._web_upload_sessions.clear()
-        tasks = tuple(self._ai_tasks)
+        tasks = set(self._processing_tasks.values())
         if self._trash_cleanup_task:
-            tasks = (*tasks, self._trash_cleanup_task)
+            tasks.add(self._trash_cleanup_task)
         if self._embedding_job_task:
-            tasks = (*tasks, self._embedding_job_task)
+            tasks.add(self._embedding_job_task)
+        if self._duplicate_job_task:
+            tasks.add(self._duplicate_job_task)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -248,14 +504,15 @@ class ImageLibraryPlugin(Star):
     @image_library_group.command("帮助")
     async def command_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "图集指令：\n"
-            "/图集 收藏 [分类]（省略分类时放入待处理；附上图片/视频或回复含媒体的消息；仅 AstrBot 管理员）\n"
+            "图片收藏指令：\n"
+            "/收藏 [分类]（省略分类时放入待处理；附上图片/视频或回复含媒体的消息；仅 AstrBot 管理员）\n"
             "分类不存在时会自动创建。\n"
-            "/图集 看 <分类> [媒体编号]（不填编号时随机查看）\n"
-            "/图集 搜索 <标签关键词>（模糊匹配标签并随机返回图片或视频）\n"
-            "/图集 语义搜索 <画面描述>（按语义匹配并随机返回一张图片）\n"
+            "/看 <分类> [媒体编号]（不填编号时随机查看）\n"
+            "/搜图 <标签关键词>（模糊匹配标签/别名；搜父标签时包含子标签，并随机返回图片或视频）\n"
+            "/语义搜索 <画面描述>（按语义匹配并随机返回一张图片）\n"
+            "/分类（查看可用分类）\n"
             "/图集 删除 <媒体编号>（移入回收站，仅管理员）\n"
-            "/图集 分类\n"
+            "/图集 帮助\n"
             "支持 JPG、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM。\n"
             "WebUI 可批量导入、移动、回收站管理和管理媒体分类：插件 → QQ/个人微信图片与视频图集。"
         )
@@ -295,7 +552,7 @@ class ImageLibraryPlugin(Star):
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
     )
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @image_library_group.command("收藏", alias={"存"})
+    @filter.command("收藏", alias={"存"})
     async def command_save(
         self, event: AstrMessageEvent, category: str | None = None
     ):
@@ -373,8 +630,8 @@ class ImageLibraryPlugin(Star):
                     if media_type == "video"
                     else await media.convert_to_file_path()
                 )
-                result = await asyncio.to_thread(
-                    self.store.add_media, local_path, target["id"], media_type, "chat"
+                result = await self._ingest_media_with_tasks(
+                    local_path, target["id"], media_type, "chat"
                 )
                 if result["duplicate"]:
                     duplicates += 1
@@ -385,8 +642,6 @@ class ImageLibraryPlugin(Star):
                         saved_videos += 1
                     else:
                         saved_images += 1
-                    if not target["is_nsfw"] and target["id"] != "pending":
-                        self._schedule_ai_evaluation(result["id"], "sfw")
             except GalleryError as exc:
                 errors.append(str(exc))
             except Exception as exc:
@@ -408,7 +663,7 @@ class ImageLibraryPlugin(Star):
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
     )
-    @image_library_group.command("分类")
+    @filter.command("分类")
     async def command_categories(self, event: AstrMessageEvent):
         may_view_nsfw = self._may_view_nsfw(event)
         categories = await asyncio.to_thread(
@@ -420,7 +675,7 @@ class ImageLibraryPlugin(Star):
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
     )
-    @image_library_group.command("看", alias={"查看"})
+    @filter.command("看", alias={"查看"})
     async def command_view(
         self,
         event: AstrMessageEvent,
@@ -462,7 +717,7 @@ class ImageLibraryPlugin(Star):
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
     )
-    @image_library_group.command("搜索", alias={"找标签"})
+    @filter.command("搜图", alias={"找标签"})
     async def command_search_tag(self, event: AstrMessageEvent, tag: str):
         allow_nsfw = self._may_view_nsfw(event)
         try:
@@ -494,7 +749,7 @@ class ImageLibraryPlugin(Star):
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
     )
-    @image_library_group.command("语义搜索", alias={"语义搜"})
+    @filter.command("语义搜索", alias={"语义搜"})
     async def command_search_semantic(self, event: AstrMessageEvent, query: str):
         query = str(query or "").strip()
         if not query or len(query) > 500:
@@ -595,10 +850,18 @@ class ImageLibraryPlugin(Star):
             page_size = request.query.get("page_size", 30, type=int)
             tag = str(request.query.get("tag", ""))[:32]
             data = await asyncio.to_thread(
-                self.store.list_images, category_id, page, page_size, tag
+                self.store.list_images,
+                category_id,
+                page,
+                page_size,
+                tag,
+                defer_video_thumbnails=True,
             )
         except (GalleryError, TypeError, ValueError) as exc:
             return error_response(str(exc), status_code=400)
+        for item in data["items"]:
+            if item["media_type"] == "video" and not item.get("thumbnail"):
+                self._schedule_video_preview_task(item["id"])
         return json_response(data)
 
     @staticmethod
@@ -608,6 +871,219 @@ class ImageLibraryPlugin(Star):
         if str(declared).lower() == "video" or str(content_type).lower().startswith("video/") or suffix in video_suffixes:
             return "video"
         return "image"
+
+    async def _ingest_media_with_tasks(
+        self,
+        source_path: str | Path,
+        category_id: str,
+        media_type: str,
+        source: str,
+        *,
+        force_compression_task: bool = False,
+        display_name: str = "",
+        retry_of: str = "",
+    ) -> dict:
+        source_path = Path(source_path)
+        media_type = str(media_type).lower()
+        target_bytes = self.store.max_video_bytes if media_type == "video" else self.store.max_image_bytes
+        needs_compression_task = force_compression_task
+        try:
+            needs_compression_task = needs_compression_task or source_path.stat().st_size > target_bytes
+        except OSError:
+            pass
+        task_ids: dict[str, str] = {}
+        metadata = {
+            "category_id": category_id,
+            "media_type": media_type,
+            "file_name": str(display_name or source_path.name)[:255],
+        }
+        if needs_compression_task:
+            task_ids["compression"] = self.store.create_processing_task(
+                "compression",
+                retry_of=retry_of,
+                source_path=str(source_path),
+                metadata=metadata,
+                message="等待媒体压缩与入库",
+            )
+        if media_type == "video":
+            task_ids["video_preview"] = self.store.create_processing_task(
+                "video_preview",
+                metadata=metadata,
+                message="等待视频预览图生成",
+            )
+
+        def progress_callback(task_type: str, progress: int, message: str) -> None:
+            task_id = task_ids.get(task_type)
+            if task_id:
+                self.store.update_processing_task(
+                    task_id,
+                    status="running",
+                    progress=min(99, max(0, int(progress))),
+                    message=message,
+                )
+
+        def cancel_check(task_type: str) -> bool:
+            task_id = task_ids.get(task_type)
+            return bool(task_id and self.store.processing_task_cancel_requested(task_id))
+
+        try:
+            result = await asyncio.to_thread(
+                self.store.add_media,
+                source_path,
+                category_id,
+                media_type,
+                source,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            compression_task = task_ids.get("compression")
+            if compression_task:
+                self.store.update_processing_task(
+                    compression_task,
+                    status="succeeded",
+                    progress=100,
+                    media_id=result["id"],
+                    source_path="",
+                    message=(
+                        "压缩已完成；目标分类已有重复媒体，已跳过入库"
+                        if result.get("duplicate")
+                        else (
+                            f"压缩完成：{self._format_task_size(result.get('original_size_bytes', 0))} → "
+                            f"{self._format_task_size(result.get('size_bytes', 0))}"
+                            if result.get("compressed")
+                            else "当前配置下无需压缩，媒体已入库"
+                        )
+                    ),
+                )
+            preview_task = task_ids.get("video_preview")
+            if preview_task:
+                if result.get("duplicate"):
+                    self.store.update_processing_task(
+                        preview_task,
+                        status="skipped",
+                        progress=100,
+                        media_id=result["id"],
+                        message="目标分类已有该视频，跳过重复预览生成",
+                    )
+                elif result.get("thumbnail_cancelled"):
+                    self.store.update_processing_task(
+                        preview_task,
+                        status="cancelled",
+                        media_id=result["id"],
+                        error=result.get("thumbnail_error") or "视频预览生成已取消。",
+                        message="已取消视频预览生成",
+                    )
+                elif result.get("thumbnail_ready"):
+                    self.store.update_processing_task(
+                        preview_task,
+                        status="succeeded",
+                        progress=100,
+                        media_id=result["id"],
+                        message="视频预览图已生成",
+                    )
+                else:
+                    self.store.update_processing_task(
+                        preview_task,
+                        status="failed",
+                        media_id=result["id"],
+                        error=result.get("thumbnail_error") or "视频预览图生成失败。",
+                        message="视频已入库，但预览图生成失败；可重试",
+                    )
+
+            category = await asyncio.to_thread(self.store.category_by_id, category_id)
+            if (
+                not result.get("duplicate")
+                and not self._web_upload_stopping
+                and category
+                and not category["is_nsfw"]
+                and category["id"] != "pending"
+            ):
+                self._schedule_ai_evaluation(result["id"], "sfw")
+            return result
+        except ProcessingTaskCancelled as exc:
+            await self._preserve_failed_ingest_source(source_path, task_ids, media_type)
+            compression_task = task_ids.get("compression")
+            if compression_task:
+                self.store.update_processing_task(
+                    compression_task,
+                    status="cancelled",
+                    error=str(exc),
+                    message="压缩任务已取消；可稍后重试",
+                )
+            preview_task = task_ids.get("video_preview")
+            if preview_task:
+                self.store.update_processing_task(
+                    preview_task,
+                    status="skipped",
+                    error="媒体未完成入库，未生成预览图。",
+                    message="媒体未完成入库，跳过预览生成",
+                )
+            raise
+        except Exception as exc:
+            await self._preserve_failed_ingest_source(source_path, task_ids, media_type)
+            compression_task = task_ids.get("compression")
+            if compression_task:
+                self.store.update_processing_task(
+                    compression_task,
+                    status="failed",
+                    error=str(exc),
+                    message="压缩或入库失败，可从任务中心重试",
+                )
+            preview_task = task_ids.get("video_preview")
+            if preview_task:
+                self.store.update_processing_task(
+                    preview_task,
+                    status="skipped",
+                    error="媒体未完成入库，未生成预览图。",
+                    message="媒体未完成入库，跳过预览生成",
+                )
+            raise
+
+    @staticmethod
+    def _format_task_size(size_bytes: int) -> str:
+        size = max(0, int(size_bytes or 0))
+        if size >= 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        if size >= 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size} B"
+
+    async def _preserve_failed_ingest_source(
+        self,
+        source_path: Path,
+        task_ids: dict[str, str],
+        media_type: str,
+    ) -> None:
+        task_id = task_ids.get("compression")
+        if not task_id or not source_path.is_file():
+            return
+        try:
+            source_limit = (
+                self.store.max_source_video_bytes
+                if media_type == "video"
+                else self.store.max_source_image_bytes
+            )
+            if source_path.stat().st_size > source_limit:
+                self.store.update_processing_task(
+                    task_id,
+                    error="源文件超过接收上限，未保留副本，无法重试。",
+                    message="原始文件超过接收上限；未保留重试副本",
+                    source_path="",
+                )
+                return
+        except OSError:
+            return
+        suffix = source_path.suffix[:12] or ".upload"
+        retry_path = self.store.staging_dir / f"retry-{task_id}{suffix}"
+        try:
+            await asyncio.to_thread(shutil.copyfile, source_path, retry_path)
+            self.store.update_processing_task(task_id, source_path=str(retry_path))
+        except Exception as exc:
+            self.store.update_processing_task(
+                task_id,
+                error=f"原始文件未能保留，无法重试：{exc}",
+                message="任务失败，重试源文件保留失败",
+            )
 
     def _prune_web_upload_state(self) -> None:
         now = time_module.monotonic()
@@ -684,21 +1160,14 @@ class ImageLibraryPlugin(Star):
                 )
                 if not category:
                     raise GalleryError("找不到目标分类，媒体未入库。")
-                result = await asyncio.to_thread(
-                    self.store.add_media,
+                result = await self._ingest_media_with_tasks(
                     source_path,
                     category_id,
                     media_type,
                     "web",
+                    display_name=self._web_upload_jobs.get(job_id, {}).get("filename", ""),
                 )
                 result["category_name"] = category["name"]
-                if (
-                    not result.get("duplicate")
-                    and not self._web_upload_stopping
-                    and not category["is_nsfw"]
-                    and category["id"] != "pending"
-                ):
-                    self._schedule_ai_evaluation(result["id"], "sfw")
             job = self._web_upload_jobs.get(job_id)
             if job is not None:
                 job.update(status="completed", result=result)
@@ -1119,6 +1588,368 @@ class ImageLibraryPlugin(Star):
             }
         )
 
+    async def web_processing_tasks(self):
+        tasks = await asyncio.to_thread(self.store.list_processing_tasks, 200)
+        sfw_version = evaluation_prompt_version(self.media_ai.sfw_evaluation_prompt)
+        nsfw_version = evaluation_prompt_version(self.media_ai.nsfw_evaluation_prompt)
+        requested_nsfw_provider = str(
+            request.query.get("nsfw_provider_id") or self.nsfw_evaluation_provider_id
+        ).strip()
+        sfw_stale = 0
+        nsfw_stale = 0
+        if self.sfw_evaluation_provider_id:
+            sfw_stale = len(await asyncio.to_thread(
+                self.store.stale_evaluation_candidates,
+                "sfw",
+                self.sfw_evaluation_provider_id,
+                sfw_version,
+            ))
+        if requested_nsfw_provider:
+            nsfw_stale = len(await asyncio.to_thread(
+                self.store.stale_evaluation_candidates,
+                "nsfw",
+                requested_nsfw_provider,
+                nsfw_version,
+            ))
+        return json_response(
+            {
+                "tasks": tasks,
+                "stale": {
+                    "sfw": sfw_stale,
+                    "nsfw": nsfw_stale,
+                    "sfw_model_id": self.sfw_evaluation_provider_id,
+                    "nsfw_model_id": requested_nsfw_provider,
+                    "sfw_prompt_version": sfw_version,
+                    "nsfw_prompt_version": nsfw_version,
+                    "embedding_model_id": self.embedding_provider_id,
+                },
+            }
+        )
+
+    def _schedule_video_preview_task(
+        self,
+        image_id: int,
+        *,
+        force: bool = False,
+        retry_of: str = "",
+    ) -> str:
+        task_key = ("video_preview", int(image_id))
+        existing_id = self._processing_task_keys.get(task_key)
+        existing = self._processing_tasks.get(existing_id or "")
+        if existing_id and existing and not existing.done():
+            return existing_id
+        if not force:
+            latest = self.store.latest_processing_task(image_id, "video_preview")
+            if latest and latest.get("status") in {"failed", "cancelled"}:
+                return ""
+        task_id = self.store.create_processing_task(
+            "video_preview",
+            media_id=int(image_id),
+            retry_of=retry_of,
+            message="等待视频预览图重建",
+        )
+        task = asyncio.create_task(
+            self._run_video_preview_task(task_id, int(image_id)),
+            name=f"{PLUGIN_NAME}-video-preview-{image_id}-{task_id[:8]}",
+        )
+        self._processing_tasks[task_id] = task
+        self._processing_task_keys[task_key] = task_id
+        task.add_done_callback(
+            lambda completed, processing_id=task_id, key=task_key:
+                self._finish_processing_task(completed, processing_id, key)
+        )
+        return task_id
+
+    async def _run_video_preview_task(self, task_id: str, image_id: int) -> None:
+        def progress_callback(_kind: str, progress: int, message: str) -> None:
+            self.store.update_processing_task(
+                task_id,
+                status="running",
+                progress=progress,
+                message=message,
+            )
+
+        def cancel_check(_kind: str) -> bool:
+            return self.store.processing_task_cancel_requested(task_id)
+
+        try:
+            async with self._video_preview_semaphore:
+                if cancel_check("video_preview"):
+                    raise ProcessingTaskCancelled("视频预览任务已取消。")
+                self.store.update_processing_task(
+                    task_id,
+                    status="running",
+                    progress=3,
+                    message="准备重新生成视频预览图",
+                )
+                await asyncio.to_thread(
+                    self.store.regenerate_video_preview,
+                    image_id,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
+            self.store.update_processing_task(
+                task_id,
+                status="succeeded",
+                progress=100,
+                message="视频预览图已重建",
+            )
+        except ProcessingTaskCancelled as exc:
+            self.store.update_processing_task(
+                task_id,
+                status="cancelled",
+                error=str(exc),
+                message="已取消视频预览重建",
+            )
+        except asyncio.CancelledError:
+            self.store.update_processing_task(
+                task_id,
+                status="cancelled",
+                error="任务已取消。",
+                message="已取消视频预览重建",
+            )
+            raise
+        except Exception as exc:
+            self.store.update_processing_task(
+                task_id,
+                status="failed",
+                error=str(exc),
+                message="视频预览重建失败，可从任务中心重试",
+            )
+
+    async def _retry_ingest_task(
+        self, source_path: Path, metadata: dict, original_task_id: str
+    ) -> None:
+        try:
+            await self._ingest_media_with_tasks(
+                source_path,
+                str(metadata.get("category_id") or ""),
+                str(metadata.get("media_type") or "image"),
+                "web-retry",
+                force_compression_task=True,
+                display_name=str(metadata.get("file_name") or source_path.name),
+                retry_of=original_task_id,
+            )
+            source_path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"任务中心重试媒体入库失败：{exc}")
+
+    async def web_processing_task_action(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("任务操作参数格式无效。", status_code=400)
+        task_id = str(payload.get("task_id") or "").strip()
+        action = str(payload.get("action") or "").strip().lower()
+        if not task_id or action not in {"retry", "cancel"}:
+            return error_response("请选择有效的任务和操作。", status_code=400)
+        row = await asyncio.to_thread(self.store.get_processing_task, task_id)
+        if not row:
+            return error_response("找不到该任务。", status_code=404)
+        if action == "cancel":
+            cancelled = await asyncio.to_thread(
+                self.store.request_processing_task_cancel, task_id
+            )
+            if not cancelled:
+                return error_response("该任务已结束，无法取消。", status_code=409)
+            runtime_task = self._processing_tasks.get(task_id)
+            if runtime_task and row["task_type"] in {"ai_evaluation", "semantic_index"}:
+                if row["status"] == "queued":
+                    self.store.update_processing_task(
+                        task_id,
+                        status="cancelled",
+                        error="任务已取消。",
+                        message="已取消",
+                    )
+                runtime_task.cancel()
+            return json_response({"cancelled": True, "task_id": task_id})
+
+        if row["status"] not in {"failed", "cancelled"}:
+            return error_response("只有失败或已取消的任务可以重试。", status_code=409)
+        try:
+            metadata = json.loads(row.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        task_type = row["task_type"]
+        if task_type == "compression":
+            source_path = Path(row.get("source_path") or "")
+            if not source_path.is_file():
+                return error_response("原始文件已不存在，无法重试压缩。", status_code=409)
+            if not metadata.get("category_id"):
+                return error_response("原任务缺少目标分类信息，无法重试。", status_code=409)
+            retry_task = asyncio.create_task(
+                self._retry_ingest_task(source_path, metadata, task_id),
+                name=f"{PLUGIN_NAME}-retry-ingest-{task_id[:8]}",
+            )
+            self._web_upload_tasks.add(retry_task)
+            retry_task.add_done_callback(self._web_upload_tasks.discard)
+            return json_response({"retried": True, "task_type": task_type})
+
+        media_id = int(row.get("media_id") or 0)
+        if media_id <= 0:
+            return error_response("原任务没有关联媒体，无法重试。", status_code=409)
+        if task_type == "video_preview":
+            new_task_id = self._schedule_video_preview_task(
+                media_id,
+                force=True,
+                retry_of=task_id,
+            )
+        elif task_type == "ai_evaluation":
+            scope = str(row.get("scope") or "")
+            provider_id = str(row.get("model_id") or "")
+            if not provider_id or not self.context.get_provider_by_id(provider_id):
+                return error_response("原评估模型当前不可用，请先在插件配置中选择有效模型。", status_code=400)
+            new_task_id = self._schedule_ai_evaluation(
+                media_id,
+                scope,
+                provider_id,
+                force=bool(metadata.get("force")),
+                retry_of=task_id,
+            )
+        elif task_type == "semantic_index":
+            provider_id = str(row.get("model_id") or self.embedding_provider_id)
+            if not provider_id or not self.context.get_provider_by_id(provider_id):
+                return error_response("原 Embedding 模型当前不可用，请先在插件配置中选择有效模型。", status_code=400)
+            new_task_id = self._schedule_embedding_task(
+                media_id,
+                str(row.get("scope") or ""),
+                provider_id,
+                retry_of=task_id,
+            )
+        else:
+            return error_response("该类型任务暂不支持重试。", status_code=400)
+        if not new_task_id:
+            return error_response("已有相同媒体任务正在运行。", status_code=409)
+        return json_response({"retried": True, "task_id": new_task_id, "task_type": task_type})
+
+    async def web_reassess_stale_media(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("重评参数格式无效。", status_code=400)
+        scope = str(payload.get("scope") or "").strip().lower()
+        if scope not in {"sfw", "nsfw"}:
+            return error_response("请选择 SFW 或 NSFW 范围。", status_code=400)
+        if scope == "sfw":
+            provider_id = self.sfw_evaluation_provider_id
+            prompt = self.media_ai.sfw_evaluation_prompt
+        else:
+            provider_id = str(payload.get("provider_id") or self.nsfw_evaluation_provider_id).strip()
+            prompt = self.media_ai.nsfw_evaluation_prompt
+        if not provider_id:
+            return error_response("请先选择对应范围的视觉评估模型。", status_code=400)
+        if not self.context.get_provider_by_id(provider_id):
+            return error_response("所选视觉评估模型当前不可用。", status_code=400)
+        prompt_version = evaluation_prompt_version(prompt)
+        try:
+            candidates = await asyncio.to_thread(
+                self.store.stale_evaluation_candidates,
+                scope,
+                provider_id,
+                prompt_version,
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        batch_id = uuid.uuid4().hex
+        scheduled = 0
+        for image_id in candidates:
+            task_id = self._schedule_ai_evaluation(
+                image_id,
+                scope,
+                provider_id,
+                force=True,
+                batch_id=batch_id,
+            )
+            if task_id:
+                scheduled += 1
+        return json_response(
+            {
+                "scope": scope,
+                "stale": len(candidates),
+                "scheduled": scheduled,
+                "skipped_active": len(candidates) - scheduled,
+                "batch_id": batch_id,
+                "model_id": provider_id,
+                "prompt_version": prompt_version,
+            }
+        )
+
+    async def web_tag_taxonomy(self):
+        data = await asyncio.to_thread(self.store.tag_taxonomy)
+        return json_response(data)
+
+    async def web_save_tag_alias(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("标签别名参数格式无效。", status_code=400)
+        try:
+            result = await asyncio.to_thread(
+                self.store.save_tag_alias,
+                payload.get("alias", ""),
+                payload.get("canonical_tag", ""),
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
+
+    async def web_delete_tag_alias(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("标签别名参数格式无效。", status_code=400)
+        try:
+            deleted = await asyncio.to_thread(
+                self.store.delete_tag_alias, payload.get("alias", "")
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response({"deleted": deleted})
+
+    async def web_save_tag_parent(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("标签层级参数格式无效。", status_code=400)
+        try:
+            result = await asyncio.to_thread(
+                self.store.save_tag_parent,
+                payload.get("child_tag", ""),
+                payload.get("parent_tag", ""),
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
+
+    async def web_delete_tag_parent(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("标签层级参数格式无效。", status_code=400)
+        try:
+            deleted = await asyncio.to_thread(
+                self.store.delete_tag_parent, payload.get("child_tag", "")
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response({"deleted": deleted})
+
+    async def web_preview_tag_normalization(self):
+        try:
+            result = await asyncio.to_thread(self.store.preview_tag_normalization)
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
+
+    async def web_apply_tag_normalization(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict) or payload.get("confirm") is not True:
+            return error_response("请先确认预览的标签规范化操作。", status_code=400)
+        try:
+            result = await asyncio.to_thread(
+                self.store.normalize_tag_aliases,
+                payload.get("plan_token", ""),
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=409)
+        return json_response(result)
+
     async def web_update_tags(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
@@ -1167,7 +1998,7 @@ class ImageLibraryPlugin(Star):
         except (TypeError, ValueError, GalleryError) as exc:
             return error_response(str(exc), status_code=400)
 
-        indexed = False
+        embedding_scheduled = False
         scope = result["scope"]
         searchable_text = "\n".join(
             part
@@ -1175,27 +2006,17 @@ class ImageLibraryPlugin(Star):
             if part
         )
         if scope and searchable_text and self.embedding_provider_id:
-            try:
-                provider = self.context.get_provider_by_id(self.embedding_provider_id)
-                if not provider:
-                    raise GalleryError("Embedding 提供商当前不可用。")
-                vector = await create_embedding(provider, searchable_text)
-                fingerprint = embedding_fingerprint(provider, self.embedding_provider_id)
-                await asyncio.to_thread(
-                    self.store.save_embedding,
+            embedding_scheduled = bool(
+                self._schedule_embedding_task(
                     image_id,
                     scope,
                     self.embedding_provider_id,
-                    fingerprint,
-                    vector,
                 )
-                indexed = True
-            except Exception as exc:
-                logger.warning(f"保存媒体详情后重建语义向量失败（媒体 {image_id}）：{exc}")
+            )
         return json_response(
             {
                 "updated": True,
-                "embedding_indexed": indexed,
+                "embedding_scheduled": embedding_scheduled,
                 "ai_cleared": result["ai_cleared"],
                 "can_evaluate": result["can_evaluate"],
             }
@@ -1230,15 +2051,138 @@ class ImageLibraryPlugin(Star):
             )
         except (TypeError, ValueError, GalleryError) as exc:
             return error_response(str(exc) or "媒体编号无效。", status_code=400)
+        scheduled = 0
         for image_id in candidates:
-            self._schedule_ai_evaluation(image_id, scope, provider_id)
+            if self._schedule_ai_evaluation(image_id, scope, provider_id):
+                scheduled += 1
         return json_response(
             {
-                "scheduled": len(candidates),
-                "skipped_existing": skipped_existing,
+                "scheduled": scheduled,
+                "skipped_existing": skipped_existing + len(candidates) - scheduled,
                 "scope": scope,
             }
         )
+
+    async def web_duplicates_scan(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("重复项扫描参数格式无效。", status_code=400)
+        try:
+            threshold = int(payload.get("threshold", 8))
+        except (TypeError, ValueError):
+            return error_response("相似度阈值必须是 0–16 的整数。", status_code=400)
+        if threshold < 0 or threshold > 16:
+            return error_response("相似度阈值必须是 0–16 的整数。", status_code=400)
+        if self._duplicate_job_task and not self._duplicate_job_task.done():
+            return error_response("已有重复项检查正在运行。", status_code=409)
+        job = {
+            "job_id": uuid.uuid4().hex,
+            "status": "running",
+            "phase": "starting",
+            "processed": 0,
+            "total": 0,
+            "hash_errors": 0,
+            "threshold": threshold,
+            "exact_groups": 0,
+            "similar_pairs": 0,
+            "truncated": False,
+        }
+        self._duplicate_job = job
+        self._duplicate_scan_results = None
+        self._duplicate_job_task = asyncio.create_task(
+            self._run_duplicate_scan(job, threshold),
+            name=f"{PLUGIN_NAME}-duplicate-scan",
+        )
+        return json_response(job)
+
+    async def _run_duplicate_scan(self, job: dict, threshold: int) -> None:
+        def report_progress(phase, processed, total, hash_errors):
+            job.update(
+                phase=str(phase),
+                processed=int(processed),
+                total=int(total),
+                hash_errors=int(hash_errors),
+            )
+        try:
+            results = await asyncio.to_thread(
+                self.store.scan_duplicates, threshold, report_progress
+            )
+            self._duplicate_scan_results = results
+            job.update(
+                status="completed",
+                phase="completed",
+                processed=results["total_images"],
+                total=results["total_images"],
+                hash_errors=results["hash_errors"],
+                exact_groups=len(results["exact_groups"]),
+                similar_pairs=len(results["similar_pairs"]),
+                truncated=results["truncated"],
+            )
+        except asyncio.CancelledError:
+            job["status"] = "cancelled"
+            raise
+        except Exception as exc:
+            job.update(status="failed", error=str(exc))
+            logger.exception(f"跨分类重复项扫描失败：{exc}")
+
+    async def web_duplicates_status(self):
+        if not self._duplicate_job:
+            return json_response({"status": "idle", "active": False})
+        job = dict(self._duplicate_job)
+        job["active"] = job["status"] == "running"
+        return json_response(job)
+
+    async def web_duplicates_results(self):
+        results = self._duplicate_scan_results
+        if not results or not self._duplicate_job or self._duplicate_job.get("status") != "completed":
+            return error_response("请先完成重复项检查。", status_code=409)
+        kind = str(request.query.get("kind", "exact")).strip().lower()
+        if kind not in {"exact", "similar"}:
+            return error_response("结果类型必须是 exact 或 similar。", status_code=400)
+        try:
+            page = max(1, request.query.get("page", 1, type=int))
+            page_size = max(1, min(20, request.query.get("page_size", 10, type=int)))
+        except (TypeError, ValueError):
+            return error_response("分页参数无效。", status_code=400)
+        entries = results["exact_groups"] if kind == "exact" else results["similar_pairs"]
+        total = len(entries)
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        start = (page - 1) * page_size
+        selected_entries = entries[start : start + page_size]
+        ids = []
+        if kind == "exact":
+            for entry in selected_entries:
+                ids.extend(entry["ids"])
+        else:
+            for entry in selected_entries:
+                ids.extend((entry["first_id"], entry["second_id"]))
+        cards = await asyncio.to_thread(self.store.duplicate_media_cards, ids)
+        items = []
+        if kind == "exact":
+            for entry in selected_entries:
+                items.append({
+                    "sha256": entry["sha256"],
+                    "media": [cards[media_id] for media_id in entry["ids"] if media_id in cards],
+                })
+        else:
+            for entry in selected_entries:
+                first = cards.get(entry["first_id"])
+                second = cards.get(entry["second_id"])
+                if first and second:
+                    items.append({"distance": entry["distance"], "media": [first, second]})
+        return json_response({
+            "kind": kind,
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "pages": pages,
+            "threshold": results["threshold"],
+            "hash_errors": results["hash_errors"],
+            "truncated": results["truncated"],
+            "total_images": results["total_images"],
+        })
 
     async def web_ai_reindex(self):
         payload = await request.json(default={})
@@ -1293,68 +2237,53 @@ class ImageLibraryPlugin(Star):
                 "processed": 0,
                 "indexed": 0,
                 "failed": 0,
+                "cancelled": 0,
             }
             self._embedding_job = job
             return json_response(job)
 
+        batch_id = uuid.uuid4().hex
+        child_tasks = []
+        for candidate in candidates:
+            task_id = self._schedule_embedding_task(
+                candidate["image_id"],
+                scope,
+                provider_id,
+                batch_id=batch_id,
+            )
+            runtime_task = self._processing_tasks.get(task_id or "")
+            if runtime_task:
+                child_tasks.append(runtime_task)
         job = {
-            "job_id": uuid.uuid4().hex,
+            "job_id": batch_id,
             "scope": scope,
             "status": "running",
-            "total": len(candidates),
+            "total": len(child_tasks),
             "processed": 0,
             "indexed": 0,
             "failed": 0,
+            "cancelled": 0,
         }
         self._embedding_job = job
         self._embedding_job_task = asyncio.create_task(
-            self._run_embedding_reindex(job, candidates, provider, provider_id),
+            self._run_embedding_batch(job, child_tasks),
             name=f"{PLUGIN_NAME}-embedding-reindex-{scope}",
         )
         return json_response(job)
-
-    async def _run_embedding_reindex(
-        self, job: dict, candidates: list[dict], provider, provider_id: str
-    ) -> None:
-        scope = job["scope"]
-        try:
-            fingerprint = embedding_fingerprint(provider, provider_id)
-            for candidate in candidates:
-                image_id = candidate["image_id"]
-                try:
-                    vector = await create_embedding(
-                        provider, candidate["searchable_text"]
-                    )
-                    await asyncio.to_thread(
-                        self.store.save_embedding,
-                        image_id,
-                        scope,
-                        provider_id,
-                        fingerprint,
-                        vector,
-                    )
-                    job["indexed"] += 1
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    job["failed"] += 1
-                    logger.warning(
-                        f"批量重建语义索引失败（范围 {scope}，媒体 {image_id}）：{exc}"
-                    )
-                finally:
-                    job["processed"] += 1
-            job["status"] = "completed"
-        except asyncio.CancelledError:
-            job["status"] = "cancelled"
-            raise
-        except Exception as exc:
-            job["status"] = "failed"
-            logger.exception(f"批量重建语义索引任务失败：{exc}")
 
     async def web_ai_reindex_status(self):
         if not self._embedding_job:
             return json_response({"status": "idle", "active": False})
         job = dict(self._embedding_job)
+        if job.get("status") == "running":
+            summary = await asyncio.to_thread(
+                self.store.processing_task_batch_summary,
+                job["job_id"],
+            )
+            job.update(summary)
+            if summary["active"] == 0:
+                job["status"] = "completed"
+                self._embedding_job.update(job)
         job["active"] = job["status"] == "running"
         return json_response(job)
 

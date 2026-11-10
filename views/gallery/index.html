@@ -15,7 +15,12 @@
           <h1>图片与视频图集</h1>
           <p class="subtitle">按分类整理、批量导入、移动和删除收藏媒体。</p>
         </div>
-        <button class="button secondary" id="refreshButton" type="button">刷新</button>
+        <div class="header-actions">
+          <button class="button secondary" id="openTaskCenterButton" type="button">
+            AI 处理任务中心 <span class="task-center-badge" id="taskCenterBadge" hidden>0</span>
+          </button>
+          <button class="button secondary" id="refreshButton" type="button">刷新</button>
+        </div>
       </header>
 
       <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
@@ -29,6 +34,8 @@
           <button class="button secondary" id="createCategoryButton" type="button">新建分类</button>
           <button class="button secondary danger-text" id="deleteCategoryButton" type="button">删除分类</button>
           <input id="fileInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/bmp,video/mp4,video/quicktime,video/3gpp,video/x-msvideo,video/x-matroska,video/webm,.mp4,.mov,.3gp,.avi,.mkv,.webm" multiple hidden />
+          <button class="button secondary" id="tagTaxonomyButton" type="button">标签别名与层级</button>
+          <button class="button secondary" id="duplicateCheckButton" type="button">重复项检查</button>
           <button class="button primary" id="uploadButton" type="button">批量导入</button>
         </div>
         <p class="hint toolbar-hint">支持 JPG、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM；重复文件会自动跳过。多文件按顺序导入。</p>
@@ -69,7 +76,109 @@
         <p class="hint">重建会将对应范围的文字描述和 AI 标签发送给当前 Embedding 提供商；不会调用视觉评估模型。</p>
       </section>
 
-      <section class="panel gallery-panel" aria-label="媒体列表">
+      <section class="panel taxonomy-panel" id="tagTaxonomyPanel" aria-label="标签别名与层级" hidden>
+        <div class="taxonomy-heading">
+          <div>
+            <h2>标签别名与层级</h2>
+            <p class="hint">别名用于搜图匹配和手工标签录入提示；建立关系不会改写已有标签。搜索父标签会包含其子标签。批量规范化会改写存量图片/视频及回收站标签，并需单独预览确认。</p>
+          </div>
+          <button class="button secondary" id="tagTaxonomyBackButton" type="button">返回图集</button>
+        </div>
+        <div class="taxonomy-grid">
+          <section class="taxonomy-card">
+            <h3>同义标签</h3>
+            <form id="tagAliasForm" class="taxonomy-form">
+              <label>别名
+                <input id="tagAliasInput" class="text-input" maxlength="32" list="tagSuggestionList" autocomplete="off" placeholder="例如：初音" required />
+              </label>
+              <label>规范标签
+                <input id="tagCanonicalInput" class="text-input" maxlength="32" list="tagSuggestionList" autocomplete="off" placeholder="例如：初音未来" required />
+              </label>
+              <button class="button primary" type="submit">保存别名</button>
+            </form>
+            <div class="taxonomy-list" id="tagAliasList"></div>
+          </section>
+          <section class="taxonomy-card">
+            <h3>可选层级</h3>
+            <form id="tagHierarchyForm" class="taxonomy-form">
+              <label>子标签
+                <input id="tagChildInput" class="text-input" maxlength="32" list="tagSuggestionList" autocomplete="off" placeholder="例如：初音未来" required />
+              </label>
+              <label>父标签
+                <input id="tagParentInput" class="text-input" maxlength="32" list="tagSuggestionList" autocomplete="off" placeholder="例如：角色" required />
+              </label>
+              <button class="button primary" type="submit">保存层级</button>
+            </form>
+            <div class="taxonomy-list" id="tagHierarchyList"></div>
+          </section>
+        </div>
+        <section class="taxonomy-normalize">
+          <div>
+            <h3>批量规范化已有标签</h3>
+            <p class="hint">只会按上方别名规则改写完全匹配的 AI/手工标签；改写前会显示影响数量，并要求再次确认。AI 标签变化会清除对应旧语义向量，需要之后重建语义索引。</p>
+          </div>
+          <button class="button secondary" id="previewTagNormalizationButton" type="button">预览规范化</button>
+          <div class="normalization-preview" id="tagNormalizationPreview" hidden>
+            <p class="hint" id="tagNormalizationSummary"></p>
+            <div class="taxonomy-list" id="tagNormalizationAliases"></div>
+            <button class="button danger" id="applyTagNormalizationButton" type="button" disabled>确认并规范化</button>
+          </div>
+        </section>
+      </section>
+      <datalist id="tagSuggestionList"></datalist>
+
+      <section class="panel duplicate-panel" id="duplicatePanel" aria-label="重复项检查" hidden>
+        <div class="duplicate-heading">
+          <div>
+            <h2>跨分类重复项与相似图</h2>
+            <p class="hint">按文件 SHA-256 查找跨分类完全相同的图片或视频；感知相似检查只比较不同分类中的图片。相似结果可能误报；若要清理完全重复项，请确保每组至少保留一项，再将所选媒体移入回收站。</p>
+          </div>
+          <button class="button secondary" id="duplicateBackButton" type="button">返回图集</button>
+        </div>
+        <div class="duplicate-controls">
+          <label class="provider-picker">相似度阈值
+            <select id="duplicateThresholdSelect" aria-label="选择相似图检测阈值">
+              <option value="4">4 · 更严格</option>
+              <option value="6">6</option>
+              <option value="8" selected>8 · 默认</option>
+              <option value="10">10</option>
+              <option value="12">12 · 更多候选</option>
+            </select>
+          </label>
+          <button class="button primary" id="startDuplicateScanButton" type="button">开始扫描</button>
+          <span class="hint" id="duplicateScanStatus" aria-live="polite">尚未扫描</span>
+        </div>
+        <div class="duplicate-progress" id="duplicateProgress" hidden>
+          <div class="duplicate-progress-track"><span id="duplicateProgressFill"></span></div>
+          <span class="hint" id="duplicateProgressLabel"></span>
+        </div>
+        <div class="duplicate-tabs" role="tablist" aria-label="重复项类型">
+          <button class="button secondary active" id="exactDuplicatesTab" type="button" role="tab">跨分类完全重复 <span id="exactDuplicatesCount">0</span></button>
+          <button class="button secondary" id="similarImagesTab" type="button" role="tab">相似图片 <span id="similarImagesCount">0</span></button>
+        </div>
+        <div class="duplicate-selection-actions">
+          <button class="button secondary" id="duplicateSelectAllButton" type="button" disabled>全选本页</button>
+          <button class="button secondary" id="duplicateInvertSelectionButton" type="button" disabled>反选本页</button>
+          <button class="button secondary" id="duplicateClearSelectionButton" type="button" disabled>取消选择</button>
+          <span class="selected-count" id="duplicateSelectedCount">已选 0 项</span>
+          <button class="button danger" id="duplicateTrashButton" type="button" disabled>移入回收站</button>
+        </div>
+        <div id="duplicateResults" class="duplicate-results" aria-live="polite"></div>
+        <div class="empty-state" id="duplicateEmptyState" hidden>
+          <div class="empty-icon">✓</div>
+          <strong>当前检查范围内没有匹配项</strong>
+          <span>跨分类完全重复和相似图片会分别显示在上方标签页。</span>
+        </div>
+        <footer class="pagination duplicate-pagination" id="duplicatePagination" hidden>
+          <span id="duplicatePageSummary">第 1 页</span>
+          <div>
+            <button class="button secondary" id="duplicatePreviousPageButton" type="button">上一页</button>
+            <button class="button secondary" id="duplicateNextPageButton" type="button">下一页</button>
+          </div>
+        </footer>
+      </section>
+
+      <section class="panel gallery-panel" id="galleryPanel" aria-label="媒体列表">
         <div class="gallery-heading">
           <div>
             <h2 id="galleryTitle">媒体</h2>
@@ -121,6 +230,44 @@
       <p class="footer-note">“待处理”是媒体归档分类，不可删除。删除的媒体会先进入回收站，并在服务器本地时间每日 0 点自动清空。</p>
     </main>
 
+    <div class="modal-backdrop task-center-backdrop" id="taskCenterModal" hidden>
+      <section class="task-center-modal" role="dialog" aria-modal="true" aria-labelledby="taskCenterTitle">
+        <div class="task-center-heading">
+          <div>
+            <p class="eyebrow">AI PROCESSING</p>
+            <h2 id="taskCenterTitle">AI 处理任务中心</h2>
+            <p class="hint">查看媒体压缩、视频预览、AI 评估和语义索引任务；失败项可重试，进行中的任务可取消。</p>
+          </div>
+          <div class="task-center-heading-actions">
+            <button class="button secondary" id="refreshTasksButton" type="button">刷新任务</button>
+            <button class="icon-button" id="closeTaskCenterButton" type="button" aria-label="关闭任务中心">×</button>
+          </div>
+        </div>
+        <section class="stale-evaluation-panel" aria-label="过期评估">
+          <div>
+            <h3>提示词或模型变更后的过期评估</h3>
+            <p class="hint" id="taskStaleSummary">正在检查评估版本…</p>
+            <p class="hint">只会重评当前描述来自 AI 且模型或提示词版本不匹配的媒体。NSFW 仍需你手动发起；提示词以哈希版本记录，不会在任务记录中保存全文。</p>
+          </div>
+          <div class="stale-task-actions">
+            <button class="button secondary" id="reassessSfwButton" type="button" disabled>重评过期 SFW</button>
+            <label class="provider-picker">NSFW 评估模型
+              <select id="taskNsfwProviderSelect" aria-label="选择重评过期 NSFW 媒体的模型"></select>
+            </label>
+            <button class="button secondary" id="reassessNsfwButton" type="button" disabled>重评过期 NSFW</button>
+          </div>
+        </section>
+        <div class="task-list-toolbar">
+          <span class="hint" id="taskListSummary" aria-live="polite">正在读取任务…</span>
+        </div>
+        <div class="task-list" id="taskList" aria-live="polite"></div>
+        <div class="empty-state task-empty-state" id="taskEmptyState" hidden>
+          <strong>还没有处理任务</strong>
+          <span>媒体进入压缩、预览、AI 评估或语义索引流程后会显示在这里。</span>
+        </div>
+      </section>
+    </div>
+
     <div class="modal-backdrop" id="categoryModal" hidden>
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <form id="categoryForm">
@@ -143,7 +290,7 @@
       </section>
     </div>
 
-    <div class="modal-backdrop" id="confirmModal" hidden>
+    <div class="modal-backdrop confirm-backdrop" id="confirmModal" hidden>
       <section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
         <p class="eyebrow">CONFIRM ACTION</p>
         <h2 id="confirmTitle">确认删除？</h2>
@@ -174,6 +321,10 @@
           <label class="field-label tags-input-label" for="tagsInput">标签</label>
           <input id="tagsInput" class="text-input" maxlength="1000" autocomplete="off" placeholder="例如：海边, 夕阳, 白色连衣裙" />
           <p class="hint">用逗号分隔，单个标签最多 32 字，每个媒体最多 30 个手工标签。AI 标签单独保留。</p>
+          <div class="tag-alias-hint-row">
+            <p class="hint" id="bulkTagAliasHint" aria-live="polite"></p>
+            <button class="button secondary" id="useCanonicalBulkTagButton" type="button" hidden></button>
+          </div>
           <div class="modal-actions">
             <button class="button secondary" id="cancelTagsModalButton" type="button">取消</button>
             <button class="button primary" type="submit">保存标签</button>
@@ -205,7 +356,8 @@
           <textarea id="detailDescriptionInput" class="text-input detail-description-input" maxlength="3000" placeholder="暂无描述；可在这里补充描述。"></textarea>
           <label class="field-label detail-tags-label" for="detailManualTagInput">手工标签</label>
           <div class="manual-tag-input-row">
-            <input id="detailManualTagInput" class="text-input" maxlength="64" autocomplete="off" placeholder="输入标签，可包含 emoji" />
+            <input id="detailManualTagInput" class="text-input" maxlength="64" list="tagSuggestionList" autocomplete="off" placeholder="输入标签，可包含 emoji" />
+            <button class="button secondary" id="useCanonicalDetailTagButton" type="button" hidden></button>
             <button class="button secondary" id="addDetailManualTagButton" type="button">添加</button>
           </div>
           <div class="tag-list detail-manual-tags" id="detailManualTagsList"></div>

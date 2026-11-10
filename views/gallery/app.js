@@ -3,11 +3,48 @@ const PAGE_SIZE = 30;
 
 const els = {
   notice: document.querySelector("#notice"),
+  openTaskCenter: document.querySelector("#openTaskCenterButton"),
+  taskCenterBadge: document.querySelector("#taskCenterBadge"),
+  taskCenterModal: document.querySelector("#taskCenterModal"),
+  closeTaskCenter: document.querySelector("#closeTaskCenterButton"),
+  refreshTasks: document.querySelector("#refreshTasksButton"),
+  taskStaleSummary: document.querySelector("#taskStaleSummary"),
+  reassessSfw: document.querySelector("#reassessSfwButton"),
+  reassessNsfw: document.querySelector("#reassessNsfwButton"),
+  taskNsfwProvider: document.querySelector("#taskNsfwProviderSelect"),
+  taskListSummary: document.querySelector("#taskListSummary"),
+  taskList: document.querySelector("#taskList"),
+  taskEmptyState: document.querySelector("#taskEmptyState"),
   categorySelect: document.querySelector("#categorySelect"),
   galleryTitle: document.querySelector("#galleryTitle"),
   gallerySummary: document.querySelector("#gallerySummary"),
   grid: document.querySelector("#imageGrid"),
   emptyState: document.querySelector("#emptyState"),
+  galleryPanel: document.querySelector("#galleryPanel"),
+  duplicatePanel: document.querySelector("#duplicatePanel"),
+  duplicateCheck: document.querySelector("#duplicateCheckButton"),
+  duplicateBack: document.querySelector("#duplicateBackButton"),
+  duplicateThreshold: document.querySelector("#duplicateThresholdSelect"),
+  startDuplicateScan: document.querySelector("#startDuplicateScanButton"),
+  duplicateScanStatus: document.querySelector("#duplicateScanStatus"),
+  duplicateProgress: document.querySelector("#duplicateProgress"),
+  duplicateProgressFill: document.querySelector("#duplicateProgressFill"),
+  duplicateProgressLabel: document.querySelector("#duplicateProgressLabel"),
+  exactDuplicatesTab: document.querySelector("#exactDuplicatesTab"),
+  similarImagesTab: document.querySelector("#similarImagesTab"),
+  exactDuplicatesCount: document.querySelector("#exactDuplicatesCount"),
+  similarImagesCount: document.querySelector("#similarImagesCount"),
+  duplicateSelectAll: document.querySelector("#duplicateSelectAllButton"),
+  duplicateInvertSelection: document.querySelector("#duplicateInvertSelectionButton"),
+  duplicateClearSelection: document.querySelector("#duplicateClearSelectionButton"),
+  duplicateSelectedCount: document.querySelector("#duplicateSelectedCount"),
+  duplicateTrash: document.querySelector("#duplicateTrashButton"),
+  duplicateResults: document.querySelector("#duplicateResults"),
+  duplicateEmptyState: document.querySelector("#duplicateEmptyState"),
+  duplicatePagination: document.querySelector("#duplicatePagination"),
+  duplicatePageSummary: document.querySelector("#duplicatePageSummary"),
+  duplicatePreviousPage: document.querySelector("#duplicatePreviousPageButton"),
+  duplicateNextPage: document.querySelector("#duplicateNextPageButton"),
   pageSummary: document.querySelector("#pageSummary"),
   selectedCount: document.querySelector("#selectedCount"),
   selectAll: document.querySelector("#selectAllButton"),
@@ -36,6 +73,26 @@ const els = {
   nextPage: document.querySelector("#nextPageButton"),
   fileInput: document.querySelector("#fileInput"),
   uploadButton: document.querySelector("#uploadButton"),
+  tagTaxonomyButton: document.querySelector("#tagTaxonomyButton"),
+  tagTaxonomyPanel: document.querySelector("#tagTaxonomyPanel"),
+  tagTaxonomyBack: document.querySelector("#tagTaxonomyBackButton"),
+  tagAliasForm: document.querySelector("#tagAliasForm"),
+  tagAliasInput: document.querySelector("#tagAliasInput"),
+  tagCanonicalInput: document.querySelector("#tagCanonicalInput"),
+  tagAliasList: document.querySelector("#tagAliasList"),
+  tagHierarchyForm: document.querySelector("#tagHierarchyForm"),
+  tagChildInput: document.querySelector("#tagChildInput"),
+  tagParentInput: document.querySelector("#tagParentInput"),
+  tagHierarchyList: document.querySelector("#tagHierarchyList"),
+  tagSuggestionList: document.querySelector("#tagSuggestionList"),
+  previewTagNormalization: document.querySelector("#previewTagNormalizationButton"),
+  tagNormalizationPreview: document.querySelector("#tagNormalizationPreview"),
+  tagNormalizationSummary: document.querySelector("#tagNormalizationSummary"),
+  tagNormalizationAliases: document.querySelector("#tagNormalizationAliases"),
+  applyTagNormalization: document.querySelector("#applyTagNormalizationButton"),
+  useCanonicalBulkTag: document.querySelector("#useCanonicalBulkTagButton"),
+  bulkTagAliasHint: document.querySelector("#bulkTagAliasHint"),
+  useCanonicalDetailTag: document.querySelector("#useCanonicalDetailTagButton"),
   categoryModal: document.querySelector("#categoryModal"),
   categoryForm: document.querySelector("#categoryForm"),
   categoryName: document.querySelector("#categoryNameInput"),
@@ -89,6 +146,10 @@ const state = {
   searchActive: false,
   searchQuery: "",
   tagTargetIds: [],
+  tagAliases: [],
+  tagHierarchy: [],
+  tagSuggestions: [],
+  tagNormalizationPlan: null,
   detailItemId: null,
   detailCategoryId: "",
   clearAiEvaluation: false,
@@ -97,8 +158,20 @@ const state = {
   trashMode: false,
   tagProviders: [],
   sfwProviderId: "",
+  nsfwProviderId: "",
   noticeTimer: 0,
   embeddingBusy: false,
+  duplicateMode: false,
+  duplicateKind: "exact",
+  duplicatePage: 1,
+  duplicatePages: 1,
+  duplicateTotal: 0,
+  duplicateSelected: new Set(),
+  duplicateJob: null,
+  taskCenterOpen: false,
+  taskPollTimer: 0,
+  taskData: null,
+  taskStatusSnapshot: new Map(),
 };
 
 function showNotice(message, kind = "success", duration = 5000) {
@@ -169,6 +242,164 @@ async function loadCategories(preferredId = state.categoryId) {
   await loadImages();
 }
 
+function clearTagNormalizationPreview() {
+  state.tagNormalizationPlan = null;
+  els.tagNormalizationPreview.hidden = true;
+  els.applyTagNormalization.disabled = true;
+  els.tagNormalizationAliases.replaceChildren();
+}
+
+function renderTagTaxonomy() {
+  els.tagAliasList.replaceChildren();
+  if (!state.tagAliases.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint taxonomy-empty";
+    empty.textContent = "还没有设置标签别名。";
+    els.tagAliasList.append(empty);
+  }
+  for (const entry of state.tagAliases) {
+    const row = document.createElement("div");
+    row.className = "taxonomy-list-row";
+    const label = document.createElement("span");
+    label.textContent = entry.alias + " → " + entry.canonical_tag;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button secondary danger-text";
+    remove.textContent = "删除";
+    remove.dataset.alias = entry.alias;
+    remove.setAttribute("aria-label", "删除别名 " + entry.alias);
+    row.append(label, remove);
+    els.tagAliasList.append(row);
+  }
+
+  els.tagHierarchyList.replaceChildren();
+  if (!state.tagHierarchy.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint taxonomy-empty";
+    empty.textContent = "还没有设置标签层级。";
+    els.tagHierarchyList.append(empty);
+  }
+  for (const entry of state.tagHierarchy) {
+    const row = document.createElement("div");
+    row.className = "taxonomy-list-row";
+    const label = document.createElement("span");
+    label.textContent = entry.child_tag + " → 父标签：" + entry.parent_tag;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button secondary danger-text";
+    remove.textContent = "删除";
+    remove.dataset.childTag = entry.child_tag;
+    remove.setAttribute("aria-label", "删除子标签 " + entry.child_tag + " 的层级");
+    row.append(label, remove);
+    els.tagHierarchyList.append(row);
+  }
+}
+
+async function loadTagTaxonomy() {
+  const data = await bridge.apiGet("tags/taxonomy");
+  state.tagAliases = Array.isArray(data.aliases) ? data.aliases : [];
+  state.tagHierarchy = Array.isArray(data.hierarchy) ? data.hierarchy : [];
+  state.tagSuggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+  renderTagTaxonomy();
+  els.tagSuggestionList.replaceChildren();
+  const suggestionTags = new Map();
+  for (const entry of state.tagSuggestions) {
+    suggestionTags.set(entry.tag, Number(entry.usage_count) || 0);
+  }
+  for (const entry of state.tagAliases) {
+    suggestionTags.set(entry.alias, suggestionTags.get(entry.alias) || 0);
+    suggestionTags.set(entry.canonical_tag, suggestionTags.get(entry.canonical_tag) || 0);
+  }
+  for (const entry of state.tagHierarchy) {
+    suggestionTags.set(entry.child_tag, suggestionTags.get(entry.child_tag) || 0);
+    suggestionTags.set(entry.parent_tag, suggestionTags.get(entry.parent_tag) || 0);
+  }
+  for (const [tag, count] of suggestionTags) {
+    const option = document.createElement("option");
+    option.value = tag;
+    if (count) option.label = "已使用 " + count + " 次";
+    els.tagSuggestionList.append(option);
+  }
+}
+
+function exactTagAlias(value) {
+  const key = String(value || "").trim().toLocaleLowerCase();
+  return state.tagAliases.find((entry) => entry.alias.toLocaleLowerCase() === key) || null;
+}
+
+function renderAliasHint(value, hint, button) {
+  const entry = exactTagAlias(value);
+  if (!entry) {
+    hint.textContent = "";
+    button.hidden = true;
+    button.dataset.canonicalTag = "";
+    return;
+  }
+  hint.textContent = "“" + entry.alias + "”是“" + entry.canonical_tag
+    + "”的别名。保存时仍保留你输入的标签；只有点击右侧按钮才会改用规范标签。";
+  button.textContent = "改用“" + entry.canonical_tag + "”";
+  button.dataset.canonicalTag = entry.canonical_tag;
+  button.hidden = false;
+}
+
+function updateDetailTagAliasHint() {
+  renderAliasHint(
+    els.detailManualTagInput.value,
+    els.detailManualTagsHint,
+    els.useCanonicalDetailTag,
+  );
+  if (!els.detailManualTagInput.value.trim()) {
+    els.detailManualTagsHint.textContent = "按 Enter 或点击“添加”保存标签；每个标签最多 32 个字符，每个媒体最多保留 30 个手工标签。AI 标签与手工标签分开保存。";
+  }
+}
+
+function updateBulkTagAliasHint() {
+  const raw = els.tagsInput.value;
+  const splitAt = Math.max(raw.lastIndexOf(","), raw.lastIndexOf("，"), raw.lastIndexOf("、"));
+  const last = raw.slice(splitAt + 1).trim();
+  renderAliasHint(last, els.bulkTagAliasHint, els.useCanonicalBulkTag);
+}
+
+function renderTagNormalizationPreview(plan) {
+  state.tagNormalizationPlan = plan;
+  els.tagNormalizationPreview.hidden = false;
+  const invalidated = Number(plan.invalidated_embeddings) || 0;
+  els.tagNormalizationSummary.textContent = "确认后将规范化 " + plan.updated_tags
+    + " 个标签，影响 " + plan.updated_media + " 个媒体；其中 AI 标签变化会使 "
+    + invalidated + " 个语义索引失效。";
+  els.tagNormalizationAliases.replaceChildren();
+  const affected = (plan.by_alias || []).filter((entry) => entry.occurrences > 0);
+  if (!affected.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint taxonomy-empty";
+    empty.textContent = "当前没有与别名完全匹配的存量标签。";
+    els.tagNormalizationAliases.append(empty);
+  }
+  for (const entry of affected) {
+    const row = document.createElement("div");
+    row.className = "taxonomy-list-row";
+    const label = document.createElement("span");
+    label.textContent = entry.alias + " → " + entry.canonical_tag + "（" + entry.occurrences + " 项）";
+    row.append(label);
+    els.tagNormalizationAliases.append(row);
+  }
+  els.applyTagNormalization.disabled = !plan.updated_tags;
+}
+
+async function openTagTaxonomyPanel() {
+  els.activeToolbar.hidden = true;
+  els.activeSearchPanel.hidden = true;
+  els.galleryPanel.hidden = true;
+  els.duplicatePanel.hidden = true;
+  els.tagTaxonomyPanel.hidden = false;
+  clearTagNormalizationPreview();
+  try {
+    await loadTagTaxonomy();
+  } catch (error) {
+    showNotice(error.message || "读取标签体系失败。", "error", 0);
+  }
+}
+
 function updateSelectionControls() {
   const checkboxes = [...els.grid.querySelectorAll("input[data-image-id]")];
   if (state.trashMode) {
@@ -219,6 +450,288 @@ function changeVisibleSelection(mode) {
   updateSelectionControls();
 }
 
+function updateDuplicateSelectionControls() {
+  const checkboxes = [...els.duplicateResults.querySelectorAll("input[data-duplicate-id]")];
+  const hasSelection = state.duplicateSelected.size > 0;
+  els.duplicateSelectedCount.textContent = "已选 " + state.duplicateSelected.size + " 项";
+  els.duplicateSelectAll.disabled = checkboxes.length === 0;
+  els.duplicateInvertSelection.disabled = checkboxes.length === 0;
+  els.duplicateClearSelection.disabled = !hasSelection;
+  els.duplicateTrash.disabled = !hasSelection || state.duplicateSelected.size > 500;
+  els.duplicateTrash.title = state.duplicateSelected.size > 500
+    ? "每次最多移入回收站 500 项，请减少选择"
+    : "";
+}
+
+function syncDuplicateMediaSelection(id) {
+  const selected = state.duplicateSelected.has(id);
+  for (const checkbox of els.duplicateResults.querySelectorAll("input[data-duplicate-id]")) {
+    if (Number(checkbox.dataset.duplicateId) !== id) continue;
+    checkbox.checked = selected;
+    checkbox.closest(".duplicate-media-card").classList.toggle("selected", selected);
+  }
+}
+
+function makeDuplicateMediaCard(item) {
+  const card = document.createElement("article");
+  card.className = "duplicate-media-card";
+  const checkboxLabel = document.createElement("label");
+  checkboxLabel.className = "duplicate-media-check";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.dataset.duplicateId = String(item.id);
+  checkbox.checked = state.duplicateSelected.has(item.id);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked && !state.duplicateSelected.has(item.id)
+      && state.duplicateSelected.size >= 500) {
+      checkbox.checked = false;
+      showNotice("每次最多选择 500 个媒体移入回收站。", "error");
+      return;
+    }
+    if (checkbox.checked) state.duplicateSelected.add(item.id);
+    else state.duplicateSelected.delete(item.id);
+    syncDuplicateMediaSelection(item.id);
+    updateDuplicateSelectionControls();
+  });
+  checkboxLabel.append(checkbox);
+
+  const preview = document.createElement("div");
+  preview.className = "duplicate-media-preview";
+  if (item.thumbnail) {
+    const image = document.createElement("img");
+    image.src = item.thumbnail;
+    image.alt = "媒体 " + item.id + " 预览";
+    image.loading = "lazy";
+    preview.append(image);
+  } else {
+    const placeholder = document.createElement("span");
+    placeholder.className = "duplicate-no-preview";
+    placeholder.textContent = item.media_type === "video" ? "视频无预览" : "图片无预览";
+    preview.append(placeholder);
+  }
+
+  const info = document.createElement("div");
+  info.className = "duplicate-media-info";
+  const title = document.createElement("strong");
+  title.textContent = "媒体 #" + item.id + " · " + (item.category_name || "未知分类");
+  const metadata = document.createElement("span");
+  const dimensions = item.width && item.height ? item.width + " × " + item.height : "尺寸未知";
+  metadata.textContent = (item.media_type === "video" ? "视频" : "图片")
+    + " · " + dimensions + " · " + formatBytes(item.size_bytes);
+  info.append(title, metadata);
+  if (item.is_nsfw) {
+    const badge = document.createElement("span");
+    badge.className = "duplicate-nsfw-badge";
+    badge.textContent = "NSFW";
+    info.append(badge);
+  }
+  card.append(checkboxLabel, preview, info);
+  if (checkbox.checked) card.classList.add("selected");
+  return card;
+}
+
+function makeDuplicateGroup(entry) {
+  const group = document.createElement("article");
+  group.className = "duplicate-group";
+  const heading = document.createElement("div");
+  heading.className = "duplicate-group-heading";
+  const title = document.createElement("strong");
+  if (state.duplicateKind === "exact") {
+    title.textContent = "完全相同 · " + entry.media.length + " 项";
+  } else {
+    title.textContent = "相似图片 · 感知距离 " + entry.distance + "/64";
+  }
+  const detail = document.createElement("span");
+  detail.className = "hint";
+  detail.textContent = state.duplicateKind === "exact"
+    ? "SHA-256 " + String(entry.sha256 || "").slice(0, 16) + "…"
+    : "阈值 " + (state.duplicateJob?.threshold ?? els.duplicateThreshold.value) + "；距离越小越相似";
+  heading.append(title, detail);
+  const media = document.createElement("div");
+  media.className = "duplicate-media-row";
+  for (const item of entry.media) media.append(makeDuplicateMediaCard(item));
+  group.append(heading, media);
+  return group;
+}
+
+function renderDuplicateJob(job) {
+  state.duplicateJob = job;
+  const running = job?.status === "running";
+  els.startDuplicateScan.disabled = running;
+  els.startDuplicateScan.textContent = running ? "扫描中…" : "开始扫描";
+  els.duplicateProgress.hidden = !running;
+  if (running) {
+    els.duplicateEmptyState.hidden = true;
+    const total = Number(job.total) || 0;
+    const processed = Number(job.processed) || 0;
+    const percent = total > 0 ? Math.min(100, processed / total * 100) : 0;
+    els.duplicateProgressFill.style.width = String(percent) + "%";
+    const phaseLabel = job.phase === "hashing" ? "补算历史图片感知哈希"
+      : job.phase === "comparing" ? "比较不同分类中的图片"
+        : "准备扫描";
+    els.duplicateProgressLabel.textContent = total > 0
+      ? phaseLabel + "：" + processed + " / " + total
+      : phaseLabel + "…";
+    els.duplicateScanStatus.textContent = "扫描过程中可以离开此页；重新打开后会继续显示进度。";
+    return;
+  }
+  if (job?.status === "completed") {
+    els.exactDuplicatesCount.textContent = (job.exact_groups || 0) + " 组";
+    els.similarImagesCount.textContent = (job.similar_pairs || 0) + " 对";
+    const errors = Number(job.hash_errors) || 0;
+    const truncated = job.truncated ? "；相似候选已达到 3000 对上限" : "";
+    els.duplicateScanStatus.textContent = "检查完成：" + (job.exact_groups || 0)
+      + " 组完全重复，" + (job.similar_pairs || 0) + " 对相似图片"
+      + (errors ? "；" + errors + " 张图片无法计算感知哈希" : "") + truncated;
+  } else if (job?.status === "failed") {
+    els.duplicateScanStatus.textContent = "扫描失败：" + (job.error || "未知错误");
+  } else if (job?.status === "idle") {
+    els.duplicateScanStatus.textContent = "尚未扫描";
+    els.duplicateEmptyState.querySelector("strong").textContent = "尚未开始扫描";
+    els.duplicateEmptyState.querySelector("span").textContent = "选择相似度阈值后点击“开始扫描”。";
+    els.duplicateEmptyState.hidden = false;
+  } else if (job?.status === "cancelled") {
+    els.duplicateScanStatus.textContent = "扫描已取消，请重新开始。";
+    els.duplicateEmptyState.hidden = true;
+  } else {
+    els.duplicateEmptyState.hidden = true;
+  }
+}
+
+function updateDuplicateTabs() {
+  const exactActive = state.duplicateKind === "exact";
+  els.exactDuplicatesTab.classList.toggle("active", exactActive);
+  els.similarImagesTab.classList.toggle("active", !exactActive);
+  els.exactDuplicatesTab.setAttribute("aria-selected", String(exactActive));
+  els.similarImagesTab.setAttribute("aria-selected", String(!exactActive));
+}
+
+async function loadDuplicateResults() {
+  if (state.duplicateJob?.status !== "completed") return;
+  const data = await bridge.apiGet("duplicates/results", {
+    kind: state.duplicateKind,
+    page: state.duplicatePage,
+    page_size: 10,
+  });
+  state.duplicatePage = data.page;
+  state.duplicatePages = data.pages;
+  state.duplicateTotal = data.total;
+  els.duplicateResults.replaceChildren();
+  for (const item of data.items) {
+    els.duplicateResults.append(makeDuplicateGroup(item));
+  }
+  els.duplicateEmptyState.hidden = data.items.length > 0;
+  els.duplicatePagination.hidden = data.total === 0;
+  els.duplicatePageSummary.textContent = "第 " + data.page + " / " + data.pages + " 页 · 共 "
+    + data.total + (state.duplicateKind === "exact" ? " 组" : " 对");
+  els.duplicatePreviousPage.disabled = data.page <= 1;
+  els.duplicateNextPage.disabled = data.page >= data.pages;
+  updateDuplicateTabs();
+  updateDuplicateSelectionControls();
+}
+
+async function pollDuplicateScan() {
+  while (state.duplicateMode) {
+    const job = await bridge.apiGet("duplicates/status");
+    renderDuplicateJob(job);
+    if (job.status !== "running") {
+      if (job.status === "completed") {
+        state.duplicatePage = 1;
+        await loadDuplicateResults();
+        if (job.truncated) {
+          showNotice("扫描完成，但相似候选达到 3000 对上限。可降低阈值后重新扫描。", "error", 8000);
+        }
+      }
+      return;
+    }
+    await delay(1000);
+  }
+}
+
+async function openDuplicatePanel() {
+  state.duplicateMode = true;
+  els.activeToolbar.hidden = true;
+  els.activeSearchPanel.hidden = true;
+  els.galleryPanel.hidden = true;
+  els.duplicatePanel.hidden = false;
+  els.duplicateResults.replaceChildren();
+  els.duplicateEmptyState.hidden = true;
+  els.duplicatePagination.hidden = true;
+  try {
+    const job = await bridge.apiGet("duplicates/status");
+    renderDuplicateJob(job);
+    if (job.status === "completed") {
+      els.exactDuplicatesCount.textContent = (job.exact_groups || 0) + " 组";
+      els.similarImagesCount.textContent = (job.similar_pairs || 0) + " 对";
+      await loadDuplicateResults();
+    } else if (job.status === "running") {
+      await pollDuplicateScan();
+    }
+  } catch (error) {
+    showNotice(error.message || "读取重复项检查状态失败。", "error", 0);
+  }
+}
+
+async function startDuplicateScan() {
+  const threshold = Number(els.duplicateThreshold.value);
+  state.duplicateSelected.clear();
+  state.duplicatePage = 1;
+  els.exactDuplicatesCount.textContent = "…";
+  els.similarImagesCount.textContent = "…";
+  els.duplicateResults.replaceChildren();
+  els.duplicateEmptyState.hidden = true;
+  els.duplicatePagination.hidden = true;
+  updateDuplicateSelectionControls();
+  try {
+    const job = await bridge.apiPost("duplicates/scan", { threshold });
+    renderDuplicateJob(job);
+    await pollDuplicateScan();
+  } catch (error) {
+    showNotice(error.message || "启动重复项检查失败。", "error", 0);
+    renderDuplicateJob({ status: "failed", error: error.message });
+  }
+}
+
+function changeDuplicateSelection(mode) {
+  const checkboxes = [...els.duplicateResults.querySelectorAll("input[data-duplicate-id]")];
+  const ids = [...new Set(checkboxes.map((checkbox) => Number(checkbox.dataset.duplicateId)))];
+  let skipped = 0;
+  if (mode === "clear") state.duplicateSelected.clear();
+  for (const id of ids) {
+    const selected = mode === "all" ? true
+      : mode === "invert" ? !state.duplicateSelected.has(id)
+        : false;
+    if (selected && !state.duplicateSelected.has(id) && state.duplicateSelected.size >= 500) {
+      skipped += 1;
+      continue;
+    }
+    if (selected) state.duplicateSelected.add(id);
+    else state.duplicateSelected.delete(id);
+    syncDuplicateMediaSelection(id);
+  }
+  updateDuplicateSelectionControls();
+  if (skipped) showNotice("已达到单次 500 项上限，部分媒体未选中。", "error");
+}
+
+async function trashDuplicateSelection() {
+  const ids = [...state.duplicateSelected];
+  if (!ids.length || ids.length > 500) return;
+  const accepted = await confirmAction(
+    "将所选媒体移入回收站？",
+    "所选 " + ids.length + " 个媒体可从回收站还原。请确保每组完全重复项至少保留一份；相似图片也可能是误报。移入后会重新扫描当前媒体库。",
+    "移入回收站",
+  );
+  if (!accepted) return;
+  try {
+    const result = await bridge.apiPost("images/delete", { image_ids: ids });
+    state.duplicateSelected.clear();
+    showNotice("已将 " + result.trashed + " 个媒体移入回收站，正在重新扫描。");
+    await startDuplicateScan();
+  } catch (error) {
+    showNotice(error.message || "移入回收站失败。", "error", 0);
+  }
+}
+
 async function loadAiProviders() {
   const data = await bridge.apiGet("ai/providers");
   state.tagProviders = Array.isArray(data.chat) ? data.chat : [];
@@ -241,6 +754,7 @@ async function loadAiProviders() {
       ? configuredNsfwId
       : state.tagProviders[0].id;
   }
+  state.nsfwProviderId = els.nsfwProvider.value || "";
   const sfwProvider = state.tagProviders.find((provider) => provider.id === data.sfw_provider_id);
   const nsfwProvider = state.tagProviders.find((provider) => provider.id === data.nsfw_provider_id);
   const embeddingProvider = (data.embedding || []).find((provider) => provider.id === data.embedding_provider_id);
@@ -253,6 +767,251 @@ async function loadAiProviders() {
   updateSelectionControls();
 }
 
+const taskTypeLabels = {
+  compression: "媒体压缩",
+  video_preview: "视频预览图",
+  ai_evaluation: "AI 评估",
+  semantic_index: "语义索引",
+};
+const taskStatusLabels = {
+  queued: "排队中",
+  running: "处理中",
+  succeeded: "成功",
+  failed: "失败",
+  cancelled: "已取消",
+  skipped: "已跳过",
+};
+
+function updateTaskNsfwProviderOptions(configuredId = "") {
+  const currentId = els.taskNsfwProvider.value;
+  const currentOptions = [...els.taskNsfwProvider.options].map((option) => option.value);
+  const providerIds = state.tagProviders.map((provider) => provider.id);
+  if (!providerIds.length) {
+    if (currentOptions.length !== 1 || currentOptions[0] !== "") {
+      els.taskNsfwProvider.replaceChildren();
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "没有可用的聊天模型";
+      els.taskNsfwProvider.append(option);
+    }
+    return;
+  }
+  if (currentOptions.join("\u0000") === providerIds.join("\u0000")) {
+    if (currentId && providerIds.includes(currentId)) return;
+    const fallback = providerIds.includes(configuredId) ? configuredId : providerIds[0];
+    if (fallback) els.taskNsfwProvider.value = fallback;
+    return;
+  }
+  els.taskNsfwProvider.replaceChildren();
+  if (!state.tagProviders.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "没有可用的聊天模型";
+    els.taskNsfwProvider.append(option);
+    return;
+  }
+  for (const provider of state.tagProviders) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = `${provider.name} · ${provider.id}`;
+    els.taskNsfwProvider.append(option);
+  }
+  const preferred = [currentId, configuredId].find((id) =>
+    state.tagProviders.some((provider) => provider.id === id)
+  );
+  els.taskNsfwProvider.value = preferred || state.tagProviders[0].id;
+}
+
+function taskDateLabel(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function makeTaskCard(task) {
+  const card = document.createElement("article");
+  card.className = `processing-task-card task-${task.status}`;
+
+  const top = document.createElement("div");
+  top.className = "processing-task-top";
+  const title = document.createElement("strong");
+  title.textContent = taskTypeLabels[task.task_type] || task.task_type;
+  const status = document.createElement("span");
+  status.className = `task-status task-status-${task.status}`;
+  status.textContent = (taskStatusLabels[task.status] || task.status) + (task.status === "failed" && task.has_retry ? "（已有后续重试）" : "");
+  top.append(title, status);
+
+  const subject = document.createElement("p");
+  subject.className = "processing-task-subject";
+  const metadata = task.metadata || {};
+  subject.textContent = task.media_id
+    ? `媒体 #${task.media_id}${task.scope ? ` · ${task.scope.toUpperCase()}` : ""}`
+    : (metadata.file_name || "入库媒体");
+
+  const message = document.createElement("p");
+  message.className = "processing-task-message";
+  message.textContent = task.message || "等待处理";
+
+  const progress = document.createElement("div");
+  progress.className = "processing-task-progress";
+  const track = document.createElement("div");
+  track.className = "processing-task-progress-track";
+  const fill = document.createElement("span");
+  const percent = Math.max(0, Math.min(100, Number(task.progress) || 0));
+  fill.style.width = `${percent}%`;
+  track.append(fill);
+  const progressText = document.createElement("span");
+  progressText.className = "hint";
+  progressText.textContent = `${percent}%`;
+  progress.append(track, progressText);
+
+  const details = document.createElement("div");
+  details.className = "processing-task-details";
+  const detailParts = [`创建于 ${taskDateLabel(task.created_at)}`];
+  if (task.model_id) detailParts.push(`模型：${task.model_id}`);
+  if (task.prompt_version) detailParts.push(`提示词版本：${task.prompt_version}`);
+  if (task.completed_at) detailParts.push(`结束于 ${taskDateLabel(task.completed_at)}`);
+  details.textContent = detailParts.join(" · ");
+
+  card.append(top, subject, message, progress, details);
+  if (task.error) {
+    const error = document.createElement("p");
+    error.className = "processing-task-error";
+    error.textContent = `原因：${task.error}`;
+    card.append(error);
+  }
+  const actions = document.createElement("div");
+  actions.className = "processing-task-actions";
+  if (task.can_retry) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "button secondary";
+    retry.textContent = "重试";
+    retry.addEventListener("click", () => operateProcessingTask(task, "retry", retry));
+    actions.append(retry);
+  }
+  if (task.can_cancel) {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "button secondary danger-text";
+    cancel.textContent = "取消";
+    cancel.addEventListener("click", () => operateProcessingTask(task, "cancel", cancel));
+    actions.append(cancel);
+  }
+  if (actions.childElementCount) card.append(actions);
+  return card;
+}
+
+async function operateProcessingTask(task, action, button) {
+  button.disabled = true;
+  try {
+    await bridge.apiPost("tasks/action", { task_id: task.task_id, action });
+    showNotice(action === "retry" ? "已提交任务重试。" : "已请求取消任务。", "success", 3500);
+    await loadTaskCenter();
+  } catch (error) {
+    showNotice(error.message || "任务操作失败。", "error", 0);
+    button.disabled = false;
+  }
+}
+
+async function loadTaskCenter() {
+  const nsfwProviderId = els.taskNsfwProvider.value || state.nsfwProviderId || "";
+  const data = await bridge.apiGet("tasks", { nsfw_provider_id: nsfwProviderId });
+  state.taskData = data;
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  let videoPreviewCompleted = false;
+  const nextSnapshot = new Map();
+  for (const task of tasks) {
+    nextSnapshot.set(task.task_id, task.status);
+    if (
+      task.task_type === "video_preview"
+      && task.status === "succeeded"
+      && state.taskStatusSnapshot.get(task.task_id) !== "succeeded"
+    ) videoPreviewCompleted = true;
+  }
+  state.taskStatusSnapshot = nextSnapshot;
+  const stale = data.stale || {};
+  updateTaskNsfwProviderOptions(stale.nsfw_model_id || "");
+  els.taskStaleSummary.textContent =
+    `SFW：${stale.sfw_model_id ? `${stale.sfw || 0} 项过期 · 模型 ${stale.sfw_model_id} · 提示词 ${stale.sfw_prompt_version}` : "未配置评估模型"}；`
+    + `NSFW：${stale.nsfw_model_id ? `${stale.nsfw || 0} 项过期 · 当前模型 ${stale.nsfw_model_id} · 提示词 ${stale.nsfw_prompt_version}` : "请选择评估模型"}。`;
+  els.reassessSfw.disabled = !stale.sfw || !stale.sfw_model_id;
+  els.reassessNsfw.disabled = !stale.nsfw || !state.tagProviders.length;
+
+  const activeCount = tasks.filter((task) => ["queued", "running"].includes(task.status)).length;
+  const failedCount = tasks.filter((task) => task.status === "failed" && !task.has_retry).length;
+  const attentionCount = activeCount + failedCount;
+  els.taskCenterBadge.hidden = attentionCount === 0;
+  els.taskCenterBadge.textContent = attentionCount > 99 ? "99+" : String(attentionCount);
+  const counts = tasks.reduce((total, task) => {
+    total[task.status] = (total[task.status] || 0) + 1;
+    return total;
+  }, {});
+  els.taskListSummary.textContent =
+    `最近显示 ${tasks.length} 项 · 排队 ${counts.queued || 0} · 处理中 ${counts.running || 0} · 失败 ${counts.failed || 0} · 成功 ${counts.succeeded || 0}`;
+  els.taskList.replaceChildren();
+  els.taskEmptyState.hidden = tasks.length > 0;
+  for (const task of tasks) els.taskList.append(makeTaskCard(task));
+  if (videoPreviewCompleted && !els.galleryPanel.hidden && !state.searchActive && !state.trashMode) {
+    loadImages().catch(() => {});
+  }
+}
+
+function openTaskCenter() {
+  state.taskCenterOpen = true;
+  els.taskCenterModal.hidden = false;
+  loadTaskCenter().catch((error) => {
+    els.taskListSummary.textContent = error.message || "读取任务失败。";
+    showNotice(error.message || "读取任务失败。", "error", 0);
+  });
+  window.clearInterval(state.taskPollTimer);
+  state.taskPollTimer = window.setInterval(() => {
+    loadTaskCenter().catch((error) => {
+      els.taskListSummary.textContent = error.message || "刷新任务失败。";
+    });
+  }, 3000);
+}
+
+function closeTaskCenter() {
+  state.taskCenterOpen = false;
+  els.taskCenterModal.hidden = true;
+  window.clearInterval(state.taskPollTimer);
+  state.taskPollTimer = 0;
+}
+
+async function reassessStaleMedia(scope) {
+  const stale = state.taskData?.stale || {};
+  const total = Number(stale[scope]) || 0;
+  if (!total) return;
+  const providerId = scope === "sfw"
+    ? stale.sfw_model_id
+    : els.taskNsfwProvider.value;
+  if (!providerId) {
+    showNotice("请先选择可用的视觉评估模型。", "error");
+    return;
+  }
+  const accepted = await confirmAction(
+    `重评过期 ${scope.toUpperCase()} 媒体？`,
+    `将使用模型“${providerId}”和当前提示词，重新生成 ${total} 项媒体的 AI 描述与标签，并覆盖旧 AI 结果。${scope === "nsfw" ? "本操作会把所选 NSFW 媒体或视频抽帧发送给该模型。" : ""}`,
+    "开始重评",
+  );
+  if (!accepted) return;
+  const button = scope === "sfw" ? els.reassessSfw : els.reassessNsfw;
+  button.disabled = true;
+  try {
+    const result = await bridge.apiPost("tasks/reassess", { scope, provider_id: providerId });
+    showNotice(
+      `已提交 ${result.scheduled} 项过期媒体的重新评估；${result.skipped_active} 项已有任务正在运行。`,
+      "success",
+      6000,
+    );
+    await loadTaskCenter();
+  } catch (error) {
+    showNotice(error.message || "提交过期媒体重评失败。", "error", 0);
+    button.disabled = false;
+  }
+}
+
 function openTagsModal(imageIds) {
   state.tagTargetIds = [...new Set(imageIds.map(Number))];
   if (state.tagTargetIds.length < 2) {
@@ -262,6 +1021,7 @@ function openTagsModal(imageIds) {
   els.tagsModalTitle.textContent = `批量维护 ${state.tagTargetIds.length} 个媒体的标签`;
   els.tagMode.value = "add";
   els.tagsInput.value = "";
+  updateBulkTagAliasHint();
   els.tagsModal.hidden = false;
   els.tagsInput.focus();
 }
@@ -343,7 +1103,7 @@ function addDetailManualTag() {
   }
   state.detailManualTags.push(tag);
   els.detailManualTagInput.value = "";
-  els.detailManualTagsHint.textContent = "按 Enter 或点击“添加”保存标签；每个标签最多 32 个字符，每个媒体最多保留 30 个手工标签。AI 标签与手工标签分开保存。";
+  updateDetailTagAliasHint();
   renderDetailManualTags();
   els.detailManualTagInput.focus();
 }
@@ -381,7 +1141,7 @@ function openDetailModal(item) {
   );
   els.clearAiEvaluationHint.textContent = "点击后会清空 AI 描述、AI 标签和手动描述覆盖；手工标签保留。点击“保存详情”后生效。";
   els.detailManualTagInput.value = "";
-  els.detailManualTagsHint.textContent = "按 Enter 或点击“添加”保存标签；每个标签最多 32 个字符，每个媒体最多保留 30 个手工标签。AI 标签与手工标签分开保存。";
+  updateDetailTagAliasHint();
   els.detailModal.hidden = false;
   els.detailDescription.focus();
 }
@@ -729,11 +1489,11 @@ async function rebuildEmbeddingIndex(scope) {
       if (latest.job_id !== job.job_id) {
         throw new Error("索引任务状态已变化，请刷新页面查看。");
       }
-      els.reindexStatus.textContent = `正在重建 ${scopeLabel} 索引：${latest.processed} / ${latest.total}（成功 ${latest.indexed}，失败 ${latest.failed}）`;
+      els.reindexStatus.textContent = `正在重建 ${scopeLabel} 索引：${latest.processed} / ${latest.total}（成功 ${latest.indexed}，失败 ${latest.failed}，取消 ${latest.cancelled || 0}）`;
     }
     if (latest.status === "completed") {
-      els.reindexStatus.textContent = `重建完成：成功 ${latest.indexed}，失败 ${latest.failed}。`;
-      showNotice(`${scopeLabel} 索引重建完成：成功 ${latest.indexed}，失败 ${latest.failed}。`, latest.failed ? "error" : "success", 0);
+      els.reindexStatus.textContent = `重建完成：成功 ${latest.indexed}，失败 ${latest.failed}，取消 ${latest.cancelled || 0}。`;
+      showNotice(`${scopeLabel} 索引重建完成：成功 ${latest.indexed}，失败 ${latest.failed}，取消 ${latest.cancelled || 0}。`, latest.failed || latest.cancelled ? "error" : "success", 0);
       await loadImages();
     } else {
       els.reindexStatus.textContent = `索引重建${latest.status === "cancelled" ? "已中断" : "失败"}：已处理 ${latest.processed} / ${latest.total}。`;
@@ -751,6 +1511,7 @@ async function rebuildEmbeddingIndex(scope) {
 async function refresh() {
   try {
     await loadCategories();
+    await loadTagTaxonomy();
   } catch (error) {
     showNotice(error.message || "读取图集失败。", "error", 0);
   }
@@ -834,6 +1595,22 @@ function confirmAction(title, message, actionLabel = "确认删除") {
 }
 
 document.querySelector("#refreshButton").addEventListener("click", refresh);
+els.openTaskCenter.addEventListener("click", openTaskCenter);
+els.closeTaskCenter.addEventListener("click", closeTaskCenter);
+els.refreshTasks.addEventListener("click", () => {
+  loadTaskCenter().catch((error) => showNotice(error.message || "刷新任务失败。", "error", 0));
+});
+els.taskCenterModal.addEventListener("click", (event) => {
+  if (event.target === els.taskCenterModal) closeTaskCenter();
+});
+els.reassessSfw.addEventListener("click", () => reassessStaleMedia("sfw"));
+els.reassessNsfw.addEventListener("click", () => reassessStaleMedia("nsfw"));
+els.taskNsfwProvider.addEventListener("change", () => {
+  if (state.taskCenterOpen) loadTaskCenter().catch((error) => showNotice(error.message, "error", 0));
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.taskCenterOpen) closeTaskCenter();
+});
 els.categorySelect.addEventListener("change", async () => {
   state.categoryId = els.categorySelect.value;
   state.searchActive = false;
@@ -1009,8 +1786,8 @@ els.detailForm.addEventListener("submit", async (event) => {
         : "AI 数据已清空；该媒体仍有手动描述或处于待处理分类，暂不能重新评估。", "success", 7000);
     } else {
       await loadImages();
-      showNotice(result.embedding_indexed
-        ? "描述及 AI/手工标签已保存，语义索引已更新。"
+      showNotice(result.embedding_scheduled
+        ? "描述及 AI/手工标签已保存，语义索引任务已提交；可在 AI 任务中心查看进度。"
         : "描述及 AI/手工标签已保存；当前未建立语义索引。", "success", 7000);
     }
   } catch (error) {
@@ -1035,6 +1812,156 @@ els.deleteCategory.addEventListener("click", async () => {
   } catch (error) {
     showNotice(error.message || "删除分类失败。", "error", 0);
   }
+});
+
+els.tagTaxonomyButton.addEventListener("click", openTagTaxonomyPanel);
+els.tagTaxonomyBack.addEventListener("click", async () => {
+  els.tagTaxonomyPanel.hidden = true;
+  els.activeToolbar.hidden = false;
+  els.activeSearchPanel.hidden = false;
+  els.galleryPanel.hidden = false;
+  try { await loadImages(); } catch (error) { showNotice(error.message, "error", 0); }
+});
+els.tagAliasForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await bridge.apiPost("tags/aliases/save", {
+      alias: els.tagAliasInput.value,
+      canonical_tag: els.tagCanonicalInput.value,
+    });
+    els.tagAliasInput.value = "";
+    els.tagCanonicalInput.value = "";
+    clearTagNormalizationPreview();
+    await loadTagTaxonomy();
+    showNotice("已保存别名；现存标签未改写。");
+  } catch (error) {
+    showNotice(error.message || "保存标签别名失败。", "error", 0);
+  }
+});
+els.tagAliasList.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-alias]");
+  if (!button) return;
+  try {
+    await bridge.apiPost("tags/aliases/delete", { alias: button.dataset.alias });
+    clearTagNormalizationPreview();
+    await loadTagTaxonomy();
+    showNotice("已删除别名规则；媒体标签未改写。");
+  } catch (error) {
+    showNotice(error.message || "删除标签别名失败。", "error", 0);
+  }
+});
+els.tagHierarchyForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await bridge.apiPost("tags/hierarchy/save", {
+      child_tag: els.tagChildInput.value,
+      parent_tag: els.tagParentInput.value,
+    });
+    els.tagChildInput.value = "";
+    els.tagParentInput.value = "";
+    await loadTagTaxonomy();
+    showNotice("已保存层级；现存标签未改写。");
+  } catch (error) {
+    showNotice(error.message || "保存标签层级失败。", "error", 0);
+  }
+});
+els.tagHierarchyList.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-child-tag]");
+  if (!button) return;
+  try {
+    await bridge.apiPost("tags/hierarchy/delete", { child_tag: button.dataset.childTag });
+    await loadTagTaxonomy();
+    showNotice("已删除标签层级规则。");
+  } catch (error) {
+    showNotice(error.message || "删除标签层级失败。", "error", 0);
+  }
+});
+els.previewTagNormalization.addEventListener("click", async () => {
+  try {
+    const plan = await bridge.apiPost("tags/normalize/preview", {});
+    renderTagNormalizationPreview(plan);
+  } catch (error) {
+    showNotice(error.message || "生成标签规范化预览失败。", "error", 0);
+  }
+});
+els.applyTagNormalization.addEventListener("click", async () => {
+  const plan = state.tagNormalizationPlan;
+  const planToken = plan?.plan_token || plan?.token;
+  if (!planToken || !plan.updated_tags) {
+    showNotice("规范化预览令牌缺失，请重新点击“预览规范化”。", "error", 0);
+    return;
+  }
+  const accepted = await confirmAction(
+    "确认批量规范化标签？",
+    "将按预览把 " + plan.updated_tags + " 个存量标签统一为规范标签，影响 "
+      + plan.updated_media + " 个媒体。该操作会改写图片/视频和回收站中的标签；AI 标签变化后需重建对应语义索引。",
+    "确认规范化",
+  );
+  if (!accepted) return;
+  try {
+    const result = await bridge.apiPost("tags/normalize/apply", {
+      confirm: true,
+      plan_token: planToken,
+    });
+    clearTagNormalizationPreview();
+    await loadTagTaxonomy();
+    showNotice("已规范化 " + result.updated_tags + " 个标签，影响 "
+      + result.updated_media + " 个媒体；" + result.invalidated_embeddings
+      + " 个语义索引已失效，请按需重建。", "success", 9000);
+  } catch (error) {
+    clearTagNormalizationPreview();
+    showNotice(error.message || "批量规范化失败，请重新预览。", "error", 0);
+  }
+});
+els.useCanonicalDetailTag.addEventListener("click", () => {
+  els.detailManualTagInput.value = els.useCanonicalDetailTag.dataset.canonicalTag || "";
+  updateDetailTagAliasHint();
+  els.detailManualTagInput.focus();
+});
+els.useCanonicalBulkTag.addEventListener("click", () => {
+  const raw = els.tagsInput.value;
+  const splitAt = Math.max(raw.lastIndexOf(","), raw.lastIndexOf("，"), raw.lastIndexOf("、"));
+  const prefix = splitAt >= 0 ? raw.slice(0, splitAt + 1) + " " : "";
+  els.tagsInput.value = prefix + (els.useCanonicalBulkTag.dataset.canonicalTag || "");
+  updateBulkTagAliasHint();
+  els.tagsInput.focus();
+});
+els.detailManualTagInput.addEventListener("input", updateDetailTagAliasHint);
+els.tagsInput.addEventListener("input", updateBulkTagAliasHint);
+
+els.duplicateCheck.addEventListener("click", openDuplicatePanel);
+els.duplicateBack.addEventListener("click", async () => {
+  state.duplicateMode = false;
+  els.duplicatePanel.hidden = true;
+  els.galleryPanel.hidden = false;
+  els.activeToolbar.hidden = false;
+  els.activeSearchPanel.hidden = false;
+  try { await loadImages(); } catch (error) { showNotice(error.message, "error", 0); }
+});
+els.startDuplicateScan.addEventListener("click", startDuplicateScan);
+els.exactDuplicatesTab.addEventListener("click", async () => {
+  state.duplicateKind = "exact";
+  state.duplicatePage = 1;
+  try { await loadDuplicateResults(); } catch (error) { showNotice(error.message, "error", 0); }
+});
+els.similarImagesTab.addEventListener("click", async () => {
+  state.duplicateKind = "similar";
+  state.duplicatePage = 1;
+  try { await loadDuplicateResults(); } catch (error) { showNotice(error.message, "error", 0); }
+});
+els.duplicateSelectAll.addEventListener("click", () => changeDuplicateSelection("all"));
+els.duplicateInvertSelection.addEventListener("click", () => changeDuplicateSelection("invert"));
+els.duplicateClearSelection.addEventListener("click", () => changeDuplicateSelection("clear"));
+els.duplicateTrash.addEventListener("click", trashDuplicateSelection);
+els.duplicatePreviousPage.addEventListener("click", async () => {
+  if (state.duplicatePage <= 1) return;
+  state.duplicatePage -= 1;
+  try { await loadDuplicateResults(); } catch (error) { showNotice(error.message, "error", 0); }
+});
+els.duplicateNextPage.addEventListener("click", async () => {
+  if (state.duplicatePage >= state.duplicatePages) return;
+  state.duplicatePage += 1;
+  try { await loadDuplicateResults(); } catch (error) { showNotice(error.message, "error", 0); }
 });
 
 els.selectAll.addEventListener("click", () => changeVisibleSelection("all"));

@@ -46,9 +46,16 @@ MAX_IMAGE_PIXELS = 160_000_000
 MAX_IMAGE_DECODE_PIXELS = 40_000_000
 MAX_ANIMATED_IMAGE_PIXELS = 40_000_000
 PAGE_SIZE_MAX = 60
+PERCEPTUAL_HASH_DIMENSION = 32
+PERCEPTUAL_HASH_LOW_FREQUENCIES = 8
+MAX_SIMILAR_CANDIDATES = 3000
 
 
 class GalleryError(ValueError):
+    pass
+
+
+class ProcessingTaskCancelled(Exception):
     pass
 
 
@@ -125,6 +132,7 @@ class GalleryStore:
                     ai_error TEXT NOT NULL DEFAULT '',
                     ai_provider_id TEXT NOT NULL DEFAULT '',
                     ai_updated_at TEXT NOT NULL DEFAULT '',
+                    phash TEXT NOT NULL DEFAULT '',
                     UNIQUE(category_id, sha256)
                 );
                 CREATE TABLE IF NOT EXISTS media_tags (
@@ -134,6 +142,22 @@ class GalleryStore:
                     PRIMARY KEY(image_id, tag, source)
                 );
                 CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag);
+                CREATE TABLE IF NOT EXISTS tag_aliases (
+                    alias TEXT PRIMARY KEY COLLATE NOCASE,
+                    canonical_tag TEXT NOT NULL COLLATE NOCASE,
+                    created_at TEXT NOT NULL,
+                    CHECK (LOWER(alias) <> LOWER(canonical_tag))
+                );
+                CREATE INDEX IF NOT EXISTS idx_tag_aliases_canonical
+                    ON tag_aliases(canonical_tag);
+                CREATE TABLE IF NOT EXISTS tag_hierarchy (
+                    child_tag TEXT PRIMARY KEY COLLATE NOCASE,
+                    parent_tag TEXT NOT NULL COLLATE NOCASE,
+                    created_at TEXT NOT NULL,
+                    CHECK (LOWER(child_tag) <> LOWER(parent_tag))
+                );
+                CREATE INDEX IF NOT EXISTS idx_tag_hierarchy_parent
+                    ON tag_hierarchy(parent_tag);
                 CREATE TABLE IF NOT EXISTS media_embeddings (
                     image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
                     scope TEXT NOT NULL CHECK (scope IN ('sfw', 'nsfw')),
@@ -166,6 +190,7 @@ class GalleryStore:
                     ai_error TEXT NOT NULL DEFAULT '',
                     ai_provider_id TEXT NOT NULL DEFAULT '',
                     ai_updated_at TEXT NOT NULL DEFAULT '',
+                    phash TEXT NOT NULL DEFAULT '',
                     trashed_at TEXT NOT NULL,
                     embedding_scope TEXT NOT NULL DEFAULT '',
                     embedding_provider_id TEXT NOT NULL DEFAULT '',
@@ -179,6 +204,33 @@ class GalleryStore:
                 CREATE TABLE IF NOT EXISTS deleted_builtin_categories (
                     id TEXT PRIMARY KEY
                 );
+                CREATE TABLE IF NOT EXISTS processing_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    task_type TEXT NOT NULL,
+                    media_id INTEGER,
+                    scope TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    message TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '',
+                    prompt_version TEXT NOT NULL DEFAULT '',
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    retry_of TEXT NOT NULL DEFAULT '',
+                    source_path TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL DEFAULT '',
+                    cancel_requested INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_processing_tasks_created
+                    ON processing_tasks(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_processing_tasks_batch
+                    ON processing_tasks(batch_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_processing_tasks_media
+                    ON processing_tasks(media_id, task_type, status);
                 CREATE INDEX IF NOT EXISTS idx_images_category_created
                     ON images(category_id, id DESC);
                 """
@@ -206,6 +258,22 @@ class GalleryStore:
             ):
                 if column not in image_columns:
                     db.execute(f"ALTER TABLE images ADD COLUMN {column} {definition}")
+            if "phash" not in image_columns:
+                db.execute("ALTER TABLE images ADD COLUMN phash TEXT NOT NULL DEFAULT ''")
+            trash_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(media_trash)")
+            }
+            if "phash" not in trash_columns:
+                db.execute("ALTER TABLE media_trash ADD COLUMN phash TEXT NOT NULL DEFAULT ''")
+            task_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(processing_tasks)")
+            }
+            if "retry_of" not in task_columns:
+                db.execute(
+                    "ALTER TABLE processing_tasks ADD COLUMN retry_of TEXT NOT NULL DEFAULT ''"
+                )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_images_phash ON images(phash)")
             now = self._now()
             deleted_builtins = {
                 row["id"]
@@ -234,6 +302,254 @@ class GalleryStore:
                    WHERE is_nsfw = 1 AND ai_status IN ('pending', 'not_evaluated')"""
             )
         self._cleanup_orphans()
+
+    def mark_interrupted_processing_tasks(self) -> int:
+        now = self._now()
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE processing_tasks
+                   SET status = 'failed', progress = 0,
+                       message = '插件重载时任务中断，可从任务中心重试。',
+                       error = '插件重载时任务中断。', updated_at = ?,
+                       completed_at = ?, cancel_requested = 1
+                   WHERE status IN ('queued', 'running')""",
+                (now, now),
+            )
+            return cursor.rowcount
+
+    def create_processing_task(
+        self,
+        task_type: str,
+        *,
+        media_id: int | None = None,
+        scope: str = "",
+        model_id: str = "",
+        prompt_version: str = "",
+        batch_id: str = "",
+        retry_of: str = "",
+        source_path: str = "",
+        metadata: dict | None = None,
+        message: str = "等待处理",
+    ) -> str:
+        task_id = uuid.uuid4().hex
+        now = self._now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO processing_tasks
+                   (task_id, task_type, media_id, scope, status, progress, message,
+                    model_id, prompt_version, batch_id, retry_of, source_path, metadata_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    str(task_type),
+                    int(media_id) if media_id is not None else None,
+                    str(scope or ""),
+                    str(message or "等待处理")[:500],
+                    str(model_id or "")[:255],
+                    str(prompt_version or "")[:80],
+                    str(batch_id or "")[:80],
+                    str(retry_of or "")[:80],
+                    str(source_path or ""),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return task_id
+
+    def update_processing_task(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        progress: int | None = None,
+        message: str | None = None,
+        error: str | None = None,
+        media_id: int | None = None,
+        source_path: str | None = None,
+        allow_terminal_update: bool = False,
+    ) -> bool:
+        now = self._now()
+        terminal = {"succeeded", "failed", "cancelled", "skipped"}
+        updates = ["updated_at = ?"]
+        values: list[object] = [now]
+        if status is not None:
+            status = str(status)
+            updates.append("status = ?")
+            values.append(status)
+            if status == "running":
+                updates.append("started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END")
+                values.append(now)
+            if status in terminal:
+                updates.append("completed_at = ?")
+                values.append(now)
+        if progress is not None:
+            updates.append("progress = ?")
+            values.append(max(0, min(int(progress), 100)))
+        if message is not None:
+            updates.append("message = ?")
+            values.append(str(message)[:500])
+        if error is not None:
+            updates.append("error = ?")
+            values.append(str(error)[:2000])
+        if media_id is not None:
+            updates.append("media_id = ?")
+            values.append(int(media_id))
+        if source_path is not None:
+            updates.append("source_path = ?")
+            values.append(str(source_path))
+        values.append(str(task_id))
+        where = "task_id = ?"
+        if not allow_terminal_update:
+            where += " AND status NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')"
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                f"UPDATE processing_tasks SET {', '.join(updates)} WHERE {where}",
+                values,
+            )
+            return cursor.rowcount > 0
+
+    def get_processing_task(self, task_id: str) -> dict | None:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM processing_tasks WHERE task_id = ?",
+                (str(task_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_processing_task(self, media_id: int, task_type: str) -> dict | None:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM processing_tasks
+                   WHERE media_id = ? AND task_type = ?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (int(media_id), str(task_type)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def processing_task_cancel_requested(self, task_id: str) -> bool:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT cancel_requested FROM processing_tasks WHERE task_id = ?",
+                (str(task_id),),
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def request_processing_task_cancel(self, task_id: str) -> bool:
+        now = self._now()
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE processing_tasks SET cancel_requested = 1,
+                   message = '正在取消…', updated_at = ?
+                   WHERE task_id = ? AND status IN ('queued', 'running')""",
+                (now, str(task_id)),
+            )
+            return cursor.rowcount > 0
+
+    def request_cancel_all_active_processing_tasks(self) -> int:
+        now = self._now()
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE processing_tasks SET cancel_requested = 1,
+                   message = '插件正在关闭，任务将停止。', updated_at = ?
+                   WHERE status IN ('queued', 'running')""",
+                (now,),
+            )
+            return cursor.rowcount
+
+    def list_processing_tasks(self, limit: int = 150) -> list[dict]:
+        limit = max(1, min(int(limit), 300))
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                """SELECT t.*, CASE WHEN i.id IS NULL THEN 0 ELSE 1 END AS media_exists,
+                          EXISTS (SELECT 1 FROM processing_tasks retry
+                                  WHERE retry.retry_of = t.task_id) AS has_retry
+                   FROM processing_tasks t LEFT JOIN images i ON i.id = t.media_id
+                   ORDER BY CASE t.status
+                     WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'failed' THEN 2
+                     WHEN 'cancelled' THEN 3 ELSE 4 END,
+                     t.created_at DESC, t.rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["metadata"] = {}
+                item.pop("metadata_json", None)
+            task_type = item["task_type"]
+            retryable_state = item["status"] in {"failed", "cancelled"}
+            has_retry = bool(item.get("has_retry"))
+            source_available = bool(item.get("source_path") and Path(item["source_path"]).is_file())
+            can_retry = retryable_state and not has_retry and (
+                (task_type == "compression" and source_available)
+                or (task_type in {"video_preview", "ai_evaluation", "semantic_index"}
+                    and bool(item.get("media_id") and item.get("media_exists")))
+            )
+            item["can_retry"] = can_retry
+            item["can_cancel"] = item["status"] in {"queued", "running"}
+            item["has_retry"] = has_retry
+            item["source_available"] = source_available
+            item.pop("source_path", None)
+            item.pop("cancel_requested", None)
+            item.pop("media_exists", None)
+            result.append(item)
+        return result
+
+    def processing_task_batch_summary(self, batch_id: str) -> dict:
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT status, COUNT(*) AS amount FROM processing_tasks WHERE batch_id = ? GROUP BY status",
+                (str(batch_id),),
+            ).fetchall()
+        counts = {str(row["status"]): int(row["amount"]) for row in rows}
+        total = sum(counts.values())
+        processed = sum(counts.get(status, 0) for status in ("succeeded", "failed", "cancelled", "skipped"))
+        active = counts.get("queued", 0) + counts.get("running", 0)
+        return {
+            "total": total,
+            "processed": processed,
+            "indexed": counts.get("succeeded", 0),
+            "failed": counts.get("failed", 0),
+            "cancelled": counts.get("cancelled", 0),
+            "active": active,
+        }
+
+    def stale_evaluation_candidates(
+        self, scope: str, model_id: str, prompt_version: str
+    ) -> list[int]:
+        if scope not in {"sfw", "nsfw"}:
+            raise GalleryError("评估范围无效。")
+        scope_filter = (
+            "(i.is_nsfw = 1 OR c.is_nsfw = 1)"
+            if scope == "nsfw"
+            else "(i.is_nsfw = 0 AND c.is_nsfw = 0 AND c.id <> 'pending')"
+        )
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                f"""SELECT i.id,
+                         (SELECT t.model_id FROM processing_tasks t
+                          WHERE t.media_id = i.id AND t.task_type = 'ai_evaluation'
+                            AND t.status = 'succeeded'
+                          ORDER BY t.completed_at DESC, t.created_at DESC LIMIT 1) AS last_model,
+                         (SELECT t.prompt_version FROM processing_tasks t
+                          WHERE t.media_id = i.id AND t.task_type = 'ai_evaluation'
+                            AND t.status = 'succeeded'
+                          ORDER BY t.completed_at DESC, t.created_at DESC LIMIT 1) AS last_prompt
+                   FROM images i JOIN categories c ON c.id = i.category_id
+                   WHERE {scope_filter} AND i.ai_description <> ''
+                     AND i.description_override = ''
+                   ORDER BY i.id"""
+            ).fetchall()
+        return [
+            int(row["id"])
+            for row in rows
+            if str(row["last_model"] or "") != str(model_id)
+            or str(row["last_prompt"] or "") != str(prompt_version)
+        ]
 
     @staticmethod
     def _now() -> str:
@@ -288,6 +604,362 @@ class GalleryStore:
             [(image_id, tag, "manual") for tag in manual_tags]
             + [(image_id, tag, "ai") for tag in ai_tags],
         )
+
+    @staticmethod
+    def _tag_name(value: object, label: str) -> str:
+        if not isinstance(value, str):
+            raise GalleryError(f"{label}必须是文本。")
+        tags = GalleryStore.normalize_tags([value])
+        if len(tags) != 1:
+            raise GalleryError(f"请输入一个有效的{label}。")
+        return tags[0]
+
+    @staticmethod
+    def _expanded_tag_terms(db: sqlite3.Connection, value: str) -> list[str]:
+        query = " ".join(str(value or "").strip().split())
+        if not query:
+            return []
+        alias_rows = db.execute(
+            "SELECT alias, canonical_tag FROM tag_aliases ORDER BY alias COLLATE NOCASE"
+        ).fetchall()
+        alias_to_canonical = {
+            str(row["alias"]).casefold(): str(row["canonical_tag"])
+            for row in alias_rows
+        }
+        canonical_to_aliases: dict[str, list[str]] = {}
+        for row in alias_rows:
+            canonical_to_aliases.setdefault(
+                str(row["canonical_tag"]).casefold(), []
+            ).append(str(row["alias"]))
+
+        query_key = query.casefold()
+        canonical_root = alias_to_canonical.get(query_key, query)
+        terms = {query}
+        child_rows = db.execute(
+            "SELECT child_tag, parent_tag FROM tag_hierarchy"
+        ).fetchall()
+        children: dict[str, list[str]] = {}
+        hierarchy_nodes = set()
+        for row in child_rows:
+            child = str(row["child_tag"])
+            parent = str(row["parent_tag"])
+            children.setdefault(parent.casefold(), []).append(child)
+            hierarchy_nodes.add(child.casefold())
+            hierarchy_nodes.add(parent.casefold())
+        has_alias_mapping = (
+            query_key in alias_to_canonical
+            or any(str(row["canonical_tag"]).casefold() == query_key for row in alias_rows)
+        )
+        if has_alias_mapping or canonical_root.casefold() in hierarchy_nodes:
+            terms.add(canonical_root)
+            terms.update(canonical_to_aliases.get(canonical_root.casefold(), []))
+
+            pending = [canonical_root]
+            seen = {canonical_root.casefold()}
+            while pending:
+                parent = pending.pop()
+                for child in children.get(parent.casefold(), []):
+                    child_key = child.casefold()
+                    if child_key in seen:
+                        continue
+                    seen.add(child_key)
+                    terms.add(child)
+                    terms.update(canonical_to_aliases.get(child_key, []))
+                    pending.append(child)
+        return sorted(terms, key=str.casefold)
+
+    def tag_taxonomy(self) -> dict:
+        with self._lock, self._connect() as db:
+            aliases = [
+                {"alias": row["alias"], "canonical_tag": row["canonical_tag"]}
+                for row in db.execute(
+                    "SELECT alias, canonical_tag FROM tag_aliases ORDER BY alias COLLATE NOCASE"
+                )
+            ]
+            hierarchy = [
+                {"child_tag": row["child_tag"], "parent_tag": row["parent_tag"]}
+                for row in db.execute(
+                    "SELECT child_tag, parent_tag FROM tag_hierarchy ORDER BY parent_tag COLLATE NOCASE, child_tag COLLATE NOCASE"
+                )
+            ]
+            usage = {
+                str(row["tag"]): int(row["usage_count"])
+                for row in db.execute(
+                    """SELECT tag, COUNT(*) AS usage_count FROM media_tags
+                       GROUP BY tag ORDER BY usage_count DESC, tag COLLATE NOCASE LIMIT 1000"""
+                )
+            }
+        for entry in aliases:
+            usage.setdefault(entry["canonical_tag"], 0)
+        for entry in hierarchy:
+            usage.setdefault(entry["child_tag"], 0)
+            usage.setdefault(entry["parent_tag"], 0)
+        suggestions = [
+            {"tag": tag, "usage_count": count}
+            for tag, count in sorted(
+                usage.items(), key=lambda item: (-item[1], item[0].casefold())
+            )
+        ]
+        return {"aliases": aliases, "hierarchy": hierarchy, "suggestions": suggestions}
+
+    def save_tag_alias(self, alias: object, canonical_tag: object) -> dict:
+        alias = self._tag_name(alias, "别名")
+        canonical_tag = self._tag_name(canonical_tag, "规范标签")
+        alias_key = alias.casefold()
+        canonical_key = canonical_tag.casefold()
+        if alias_key == canonical_key:
+            raise GalleryError("别名和规范标签不能相同。")
+        with self._lock, self._connect() as db:
+            if db.execute(
+                "SELECT 1 FROM tag_aliases WHERE alias = ? COLLATE NOCASE",
+                (canonical_tag,),
+            ).fetchone():
+                raise GalleryError("规范标签不能本身也是别名，请改用其对应的规范标签。")
+            if db.execute(
+                """SELECT 1 FROM tag_aliases
+                   WHERE canonical_tag = ? COLLATE NOCASE
+                     AND alias <> ? COLLATE NOCASE LIMIT 1""",
+                (alias, alias),
+            ).fetchone():
+                raise GalleryError("该名称已作为其他别名的规范标签，不能再设为别名。")
+            if db.execute(
+                """SELECT 1 FROM tag_hierarchy
+                   WHERE child_tag = ? COLLATE NOCASE
+                      OR parent_tag = ? COLLATE NOCASE LIMIT 1""",
+                (alias, alias),
+            ).fetchone():
+                raise GalleryError("该名称已用于标签层级，请先调整层级关系再设为别名。")
+            db.execute(
+                """INSERT INTO tag_aliases (alias, canonical_tag, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(alias) DO UPDATE SET
+                     canonical_tag = excluded.canonical_tag,
+                     created_at = excluded.created_at""",
+                (alias, canonical_tag, self._now()),
+            )
+        return {"alias": alias, "canonical_tag": canonical_tag}
+
+    def delete_tag_alias(self, alias: object) -> bool:
+        alias = self._tag_name(alias, "别名")
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "DELETE FROM tag_aliases WHERE alias = ? COLLATE NOCASE", (alias,)
+            )
+            return cursor.rowcount > 0
+
+    def save_tag_parent(self, child_tag: object, parent_tag: object) -> dict:
+        child = self._tag_name(child_tag, "子标签")
+        parent = self._tag_name(parent_tag, "父标签")
+        child_key = child.casefold()
+        parent_key = parent.casefold()
+        if child_key == parent_key:
+            raise GalleryError("子标签和父标签不能相同。")
+        with self._lock, self._connect() as db:
+            alias_names = {
+                str(row["alias"]).casefold()
+                for row in db.execute("SELECT alias FROM tag_aliases")
+            }
+            if child_key in alias_names or parent_key in alias_names:
+                raise GalleryError("层级关系请使用规范标签名称，不能使用别名。")
+            parent_map = {
+                str(row["child_tag"]).casefold(): str(row["parent_tag"])
+                for row in db.execute("SELECT child_tag, parent_tag FROM tag_hierarchy")
+                if str(row["child_tag"]).casefold() != child_key
+            }
+            parent_map[child_key] = parent
+            current = parent
+            visited = {child_key}
+            while current:
+                current_key = current.casefold()
+                if current_key in visited:
+                    raise GalleryError("该层级关系会形成循环。")
+                visited.add(current_key)
+                current = parent_map.get(current_key, "")
+            db.execute(
+                """INSERT INTO tag_hierarchy (child_tag, parent_tag, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(child_tag) DO UPDATE SET
+                     parent_tag = excluded.parent_tag,
+                     created_at = excluded.created_at""",
+                (child, parent, self._now()),
+            )
+        return {"child_tag": child, "parent_tag": parent}
+
+    def delete_tag_parent(self, child_tag: object) -> bool:
+        child = self._tag_name(child_tag, "子标签")
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "DELETE FROM tag_hierarchy WHERE child_tag = ? COLLATE NOCASE",
+                (child,),
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _normalization_plan(db: sqlite3.Connection) -> dict:
+        alias_rows = db.execute(
+            "SELECT alias, canonical_tag FROM tag_aliases ORDER BY alias COLLATE NOCASE"
+        ).fetchall()
+        alias_map = {
+            str(row["alias"]).casefold(): (str(row["alias"]), str(row["canonical_tag"]))
+            for row in alias_rows
+        }
+        counts: dict[str, int] = {}
+        changes = []
+        for table, id_column, query in (
+            ("images", "id", "SELECT id, manual_tags, ai_tags FROM images ORDER BY id"),
+            ("media_trash", "original_id", "SELECT original_id, manual_tags, ai_tags FROM media_trash ORDER BY trash_id"),
+        ):
+            for row in db.execute(query):
+                old_manual = GalleryStore._decode_tags(row["manual_tags"])
+                old_ai = GalleryStore._decode_tags(row["ai_tags"])
+
+                def replace_aliases(tags):
+                    output = []
+                    seen = set()
+                    changed = False
+                    for tag in tags:
+                        rule = alias_map.get(tag.casefold())
+                        if rule:
+                            _, canonical = rule
+                            counts[rule[0]] = counts.get(rule[0], 0) + 1
+                            changed = True
+                        else:
+                            canonical = tag
+                        key = canonical.casefold()
+                        if key not in seen:
+                            seen.add(key)
+                            output.append(canonical)
+                        elif canonical.casefold() != tag.casefold():
+                            changed = True
+                        if canonical != tag:
+                            changed = True
+                    return output, changed
+
+                new_manual, manual_changed = replace_aliases(old_manual)
+                new_ai, ai_changed = replace_aliases(old_ai)
+                if manual_changed or ai_changed:
+                    changes.append({
+                        "table": table,
+                        "id_column": id_column,
+                        "id": int(row[id_column]),
+                        "manual_tags": new_manual,
+                        "ai_tags": new_ai,
+                        "ai_changed": ai_changed,
+                    })
+        token_payload = [
+            [
+                change["table"],
+                change["id"],
+                change["manual_tags"],
+                change["ai_tags"],
+                change["ai_changed"],
+            ]
+            for change in changes
+        ]
+        token = hashlib.sha256(
+            json.dumps(token_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "token": token,
+            "changes": changes,
+            "updated_media": len(changes),
+            "updated_tags": sum(counts.values()),
+            "by_alias": [
+                {
+                    "alias": str(row["alias"]),
+                    "canonical_tag": str(row["canonical_tag"]),
+                    "occurrences": counts.get(str(row["alias"]), 0),
+                }
+                for row in alias_rows
+            ],
+            "ai_changed_ids": [
+                change["id"] for change in changes
+                if change["table"] == "images" and change["ai_changed"]
+            ],
+        }
+
+    def preview_tag_normalization(self) -> dict:
+        with self._lock, self._connect() as db:
+            plan = self._normalization_plan(db)
+            active_ids = plan.pop("ai_changed_ids")
+            if active_ids:
+                placeholders = ",".join("?" for _ in active_ids)
+                plan["invalidated_embeddings"] = int(db.execute(
+                    f"SELECT COUNT(*) FROM media_embeddings WHERE image_id IN ({placeholders})",
+                    active_ids,
+                ).fetchone()[0])
+            else:
+                plan["invalidated_embeddings"] = 0
+            plan.pop("changes")
+            plan["plan_token"] = plan.pop("token")
+            return plan
+
+    def normalize_tag_aliases(self, plan_token: object) -> dict:
+        token = str(plan_token or "").strip()
+        if len(token) != 64:
+            raise GalleryError("规范化预览已失效，请重新预览。")
+        with self._lock, self._connect() as db:
+            plan = self._normalization_plan(db)
+            if plan["token"] != token:
+                raise GalleryError("标签或别名规则已有变化，请重新预览后确认。")
+            alias_keys = {
+                entry["alias"].casefold() for entry in plan["by_alias"]
+            }
+            updated_media = 0
+            updated_tags = 0
+            invalidated_embeddings = 0
+            for change in plan["changes"]:
+                table = change["table"]
+                id_column = change["id_column"]
+                media_id = change["id"]
+                row = db.execute(
+                    f"SELECT manual_tags, ai_tags FROM {table} WHERE {id_column} = ?",
+                    (media_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                old_manual = self._decode_tags(row["manual_tags"])
+                old_ai = self._decode_tags(row["ai_tags"])
+                new_manual = change["manual_tags"]
+                new_ai = change["ai_tags"]
+                updated_tags += sum(
+                    1 for tag in old_manual if tag.casefold() in alias_keys
+                )
+                updated_tags += sum(
+                    1 for tag in old_ai if tag.casefold() in alias_keys
+                )
+                if table == "images":
+                    db.execute(
+                        "UPDATE images SET manual_tags = ?, ai_tags = ? WHERE id = ?",
+                        (
+                            json.dumps(new_manual, ensure_ascii=False),
+                            json.dumps(new_ai, ensure_ascii=False),
+                            media_id,
+                        ),
+                    )
+                    self._sync_tag_index(db, media_id, new_manual, new_ai)
+                    if change["ai_changed"]:
+                        cursor = db.execute(
+                            "DELETE FROM media_embeddings WHERE image_id = ?",
+                            (media_id,),
+                        )
+                        invalidated_embeddings += cursor.rowcount
+                else:
+                    db.execute(
+                        """UPDATE media_trash SET manual_tags = ?, ai_tags = ?
+                           WHERE original_id = ?""",
+                        (
+                            json.dumps(new_manual, ensure_ascii=False),
+                            json.dumps(new_ai, ensure_ascii=False),
+                            media_id,
+                        ),
+                    )
+                updated_media += 1
+            return {
+                "updated_media": updated_media,
+                "updated_tags": updated_tags,
+                "invalidated_embeddings": invalidated_embeddings,
+            }
 
     def _cleanup_orphans(self) -> None:
         with self._lock, self._connect() as db:
@@ -511,7 +1183,13 @@ class GalleryStore:
             raise GalleryError("仅支持 MP4、MOV、3GP、AVI、MKV 和 WebM 视频。")
         return video_format, 0, 0, size
 
-    def _compress_image_to_target(self, source_path: Path, target_bytes: int) -> Path:
+    def _compress_image_to_target(
+        self,
+        source_path: Path,
+        target_bytes: int,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> Path:
         output_path: Path | None = None
         current_frames: list[Image.Image] = []
         succeeded = False
@@ -556,7 +1234,18 @@ class GalleryStore:
 
                     durations: list[int] = []
                     current_frames = []
-                    for frame in ImageSequence.Iterator(source):
+                    for frame_index, frame in enumerate(ImageSequence.Iterator(source)):
+                        if cancel_check and cancel_check("compression"):
+                            raise ProcessingTaskCancelled("压缩任务已取消。")
+                        if (
+                            progress_callback
+                            and frame_index % max(1, frame_count // 10) == 0
+                        ):
+                            progress_callback(
+                                "compression",
+                                min(35, 20 + round(15 * (frame_index + 1) / max(1, frame_count))),
+                                f"正在解码图片画面（{frame_index + 1}/{frame_count}）",
+                            )
                         converted = ImageOps.exif_transpose(frame.copy())
                         current_frames.append(
                             converted.convert("RGBA" if has_alpha else "RGB")
@@ -581,12 +1270,18 @@ class GalleryStore:
             qualities = (82, 66, 50, 34, 24)
             previous_scale = 1.0
 
+            attempt = 0
+            attempts_total = len(scales) * len(qualities)
             for scale in scales:
+                if cancel_check and cancel_check("compression"):
+                    raise ProcessingTaskCancelled("压缩任务已取消。")
                 if scale < previous_scale:
                     width = max(1, round(base_width * scale))
                     height = max(1, round(base_height * scale))
                     resized_frames: list[Image.Image] = []
-                    for frame in current_frames:
+                    for frame_index, frame in enumerate(current_frames):
+                        if cancel_check and cancel_check("compression"):
+                            raise ProcessingTaskCancelled("压缩任务已取消。")
                         resized_frames.append(
                             frame.resize((width, height), Image.Resampling.LANCZOS)
                         )
@@ -595,6 +1290,15 @@ class GalleryStore:
                     previous_scale = scale
 
                 for quality in qualities:
+                    attempt += 1
+                    if cancel_check and cancel_check("compression"):
+                        raise ProcessingTaskCancelled("压缩任务已取消。")
+                    if progress_callback:
+                        progress_callback(
+                            "compression",
+                            min(92, 25 + round(65 * attempt / attempts_total)),
+                            f"正在压缩图片（第 {attempt}/{attempts_total} 轮）",
+                        )
                     save_options: dict[str, object] = {
                         "format": output_format,
                         "quality": quality,
@@ -648,7 +1352,11 @@ class GalleryStore:
             return None
 
     def _compress_video_to_target(
-        self, source_path: Path, target_bytes: int
+        self,
+        source_path: Path,
+        target_bytes: int,
+        progress_callback=None,
+        cancel_check=None,
     ) -> Path:
         ffmpeg = self._ffmpeg_executable()
         if not ffmpeg:
@@ -662,7 +1370,9 @@ class GalleryStore:
         crf = 28
         deadline = time_module.monotonic() + 1800
         try:
-            for _ in range(8):
+            for attempt in range(8):
+                if cancel_check and cancel_check("compression"):
+                    raise ProcessingTaskCancelled("压缩任务已取消。")
                 remaining_seconds = deadline - time_module.monotonic()
                 if remaining_seconds <= 0:
                     raise GalleryError(
@@ -708,22 +1418,43 @@ class GalleryStore:
                         str(output_path),
                     ]
                 )
-                try:
-                    result = subprocess.run(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=max(1, remaining_seconds),
-                        check=False,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                if progress_callback:
+                    progress_callback(
+                        "compression",
+                        min(92, 25 + attempt * 8),
+                        f"正在压缩视频（第 {attempt + 1}/8 轮）",
                     )
-                except subprocess.TimeoutExpired as exc:
-                    raise GalleryError(
-                        "视频自动压缩超过 30 分钟，未入库。"
-                    ) from exc
-                if result.returncode != 0 or not output_path.is_file():
-                    error_text = str(result.stderr or "").lower()
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                stderr_text = ""
+                while True:
+                    try:
+                        _, stderr_text = process.communicate(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel_check and cancel_check("compression"):
+                            process.terminate()
+                            try:
+                                process.communicate(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.communicate()
+                            raise ProcessingTaskCancelled("压缩任务已取消。")
+                        if time_module.monotonic() >= deadline:
+                            process.terminate()
+                            try:
+                                process.communicate(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.communicate()
+                            raise GalleryError("视频自动压缩超过 30 分钟，未入库。")
+                if process.returncode != 0 or not output_path.is_file():
+                    error_text = str(stderr_text or "").lower()
                     if "unknown encoder" in error_text or "encoder not found" in error_text:
                         raise GalleryError(
                             "当前 FFmpeg 不支持 H.264 编码，无法自动压缩视频。"
@@ -752,10 +1483,66 @@ class GalleryStore:
                     pass
 
     @staticmethod
-    def _hash_file(path: Path) -> str:
+    def _perceptual_hash(path: Path) -> str:
+        """Return a 64-bit DCT perceptual hash for the first image frame."""
+        size = PERCEPTUAL_HASH_DIMENSION
+        low = PERCEPTUAL_HASH_LOW_FREQUENCIES
+        cosine = tuple(
+            tuple(
+                math.cos((2 * position + 1) * frequency * math.pi / (2 * size))
+                for position in range(size)
+            )
+            for frequency in range(low)
+        )
+        scale = tuple(
+            math.sqrt(1 / size) if frequency == 0 else math.sqrt(2 / size)
+            for frequency in range(low)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as source:
+                if getattr(source, "is_animated", False):
+                    source.seek(0)
+                if source.format == "JPEG":
+                    source.draft("L", (size, size))
+                elif source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
+                    raise ValueError("image is too large for perceptual hashing")
+                image = ImageOps.exif_transpose(source).convert("L")
+                image = image.resize((size, size), Image.Resampling.LANCZOS)
+                pixel_data = list(image.getdata())
+                pixels = [
+                    pixel_data[y * size : (y + 1) * size] for y in range(size)
+                ]
+
+        horizontal = [[0.0] * size for _ in range(low)]
+        for y in range(size):
+            row = pixels[y]
+            for u in range(low):
+                horizontal[u][y] = sum(
+                    row[x] * cosine[u][x] for x in range(size)
+                ) * scale[u]
+
+        coefficients = []
+        for v in range(low):
+            for u in range(low):
+                value = sum(
+                    horizontal[u][y] * cosine[v][y] for y in range(size)
+                ) * scale[v]
+                coefficients.append(value * scale[u])
+
+        median = sorted(coefficients[1:])[len(coefficients[1:]) // 2]
+        value = 0
+        for coefficient in coefficients:
+            value = (value << 1) | int(coefficient >= median)
+        return f"{value:016x}"
+
+    @staticmethod
+    def _hash_file(path: Path, cancel_check=None) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                if cancel_check and cancel_check():
+                    raise ProcessingTaskCancelled("压缩任务已取消。")
                 digest.update(chunk)
         return digest.hexdigest()
 
@@ -765,6 +1552,8 @@ class GalleryStore:
         category_id: str,
         media_type: str,
         source: str,
+        progress_callback=None,
+        cancel_check=None,
     ) -> dict:
         media_type = str(media_type).lower()
         if media_type not in {"image", "video"}:
@@ -784,6 +1573,8 @@ class GalleryStore:
             if media_type == "video"
             else self.max_source_image_bytes
         )
+        if cancel_check and cancel_check("compression"):
+            raise ProcessingTaskCancelled("压缩任务已取消。")
         if source_size > source_limit_bytes:
             limit_mb = source_limit_bytes // (1024 * 1024)
             media_label = "视频" if media_type == "video" else "图片"
@@ -800,7 +1591,14 @@ class GalleryStore:
         compressed_path: Path | None = None
         prepared_path = staging_path
         final_path: Path | None = None
+        thumbnail_path: Path | None = None
+        thumbnail_error = ""
+        thumbnail_cancelled = False
         try:
+            if source_size > target_bytes and progress_callback:
+                progress_callback("compression", 5, "正在复制并检查源文件")
+            if cancel_check and cancel_check("compression"):
+                raise ProcessingTaskCancelled("压缩任务已取消。")
             shutil.copyfile(source_path, staging_path)
             source_size = staging_path.stat().st_size
             if source_size > source_limit_bytes:
@@ -813,8 +1611,13 @@ class GalleryStore:
             if media_type == "video":
                 self._inspect_video(staging_path, self.max_source_video_bytes)
                 if source_size > target_bytes:
+                    if progress_callback:
+                        progress_callback("compression", 20, "视频检查完成，开始压缩")
                     compressed_path = self._compress_video_to_target(
-                        staging_path, target_bytes
+                        staging_path,
+                        target_bytes,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
                     )
                     prepared_path = compressed_path
                 media_format, width, height, size = self._inspect_video(prepared_path)
@@ -822,14 +1625,31 @@ class GalleryStore:
             else:
                 self._inspect_image(staging_path, self.max_source_image_bytes)
                 if source_size > target_bytes:
+                    if progress_callback:
+                        progress_callback("compression", 20, "图片检查完成，开始压缩")
                     compressed_path = self._compress_image_to_target(
-                        staging_path, target_bytes
+                        staging_path,
+                        target_bytes,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
                     )
                     prepared_path = compressed_path
                 media_format, width, height, size = self._inspect_image(prepared_path)
                 suffix = FORMAT_SUFFIXES[media_format]
+            if cancel_check and cancel_check("compression"):
+                raise ProcessingTaskCancelled("压缩任务已取消。")
             compressed = compressed_path is not None
-            digest = self._hash_file(prepared_path)
+            digest = self._hash_file(
+                prepared_path,
+                (lambda: cancel_check("compression")) if cancel_check else None,
+            )
+            perceptual_hash = ""
+            if media_type == "image":
+                try:
+                    perceptual_hash = self._perceptual_hash(prepared_path)
+                except Exception:
+                    # A perceptual fingerprint is optional and must not block import.
+                    perceptual_hash = ""
             with self._lock, self._connect() as db:
                 category = db.execute(
                     "SELECT id, is_nsfw FROM categories WHERE id = ?", (category_id,)
@@ -859,8 +1679,8 @@ class GalleryStore:
                     cursor = db.execute(
                         """INSERT INTO images
                            (category_id, filename, sha256, size_bytes, width, height,
-                            image_format, source, created_at, is_nsfw, media_type)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            image_format, source, created_at, is_nsfw, media_type, phash)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             category_id,
                             filename,
@@ -873,6 +1693,7 @@ class GalleryStore:
                             self._now(),
                             int(category["is_nsfw"]),
                             media_type,
+                            perceptual_hash,
                         ),
                     )
                     image_id = cursor.lastrowid
@@ -891,11 +1712,37 @@ class GalleryStore:
                     except OSError:
                         pass
                     raise
-            try:
-                self._ensure_gallery_thumbnail(final_path, media_type)
-            except Exception:
-                # Thumbnail creation must not invalidate an otherwise successful import.
-                pass
+            if source_size > target_bytes and progress_callback:
+                progress_callback("compression", 100, "压缩并入库完成")
+            if media_type == "video":
+                if progress_callback:
+                    progress_callback("video_preview", 5, "开始生成视频预览图")
+                try:
+                    thumbnail_path = self._ensure_gallery_thumbnail(
+                        final_path,
+                        media_type,
+                        progress_callback=progress_callback,
+                        cancel_check=cancel_check,
+                    )
+                    if thumbnail_path is None:
+                        thumbnail_error = "FFmpeg 未能从视频生成预览图。"
+                except ProcessingTaskCancelled:
+                    thumbnail_cancelled = True
+                    thumbnail_error = "视频预览生成已取消。"
+                except Exception as exc:
+                    thumbnail_error = str(exc) or "视频预览生成失败。"
+            else:
+                try:
+                    self._ensure_gallery_thumbnail(final_path, media_type)
+                except Exception:
+                    # Thumbnail creation must not invalidate an otherwise successful import.
+                    pass
+            if media_type == "video" and not thumbnail_cancelled and progress_callback:
+                progress_callback(
+                    "video_preview",
+                    100 if thumbnail_path else 0,
+                    "视频预览图已生成" if thumbnail_path else thumbnail_error,
+                )
             return {
                 "id": image_id,
                 "duplicate": False,
@@ -906,6 +1753,9 @@ class GalleryStore:
                 "width": width,
                 "height": height,
                 "media_type": media_type,
+                "thumbnail_ready": bool(thumbnail_path),
+                "thumbnail_error": thumbnail_error,
+                "thumbnail_cancelled": thumbnail_cancelled,
             }
         except Exception:
             if final_path is not None:
@@ -925,12 +1775,240 @@ class GalleryStore:
     def add_video(self, source_path: str | Path, category_id: str, source: str) -> dict:
         return self.add_media(source_path, category_id, "video", source)
 
+    def scan_duplicates(self, threshold: int = 8, progress_callback=None) -> dict:
+        """Find exact cross-category duplicates and perceptually similar images."""
+        threshold = max(0, min(int(threshold), 16))
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                """SELECT i.id, i.category_id, c.name AS category_name,
+                          i.filename, i.sha256, i.size_bytes, i.width, i.height,
+                          i.image_format, i.media_type, i.is_nsfw, i.phash
+                   FROM images i
+                   JOIN categories c ON c.id = i.category_id
+                   ORDER BY i.id"""
+            ).fetchall()
+
+        items = []
+        hashes_by_sha256: dict[str, list[dict]] = {}
+        for row in rows:
+            item = {
+                "id": int(row["id"]),
+                "category_id": row["category_id"],
+                "category_name": row["category_name"],
+                "filename": row["filename"],
+                "sha256": row["sha256"],
+                "size_bytes": int(row["size_bytes"]),
+                "width": int(row["width"]),
+                "height": int(row["height"]),
+                "image_format": row["image_format"],
+                "media_type": row["media_type"],
+                "is_nsfw": bool(row["is_nsfw"]),
+                "phash": str(row["phash"] or ""),
+            }
+            items.append(item)
+            hashes_by_sha256.setdefault(item["sha256"], []).append(item)
+
+        exact_groups = [
+            {"sha256": digest, "ids": [item["id"] for item in group]}
+            for digest, group in hashes_by_sha256.items()
+            if len({item["category_id"] for item in group}) > 1
+        ]
+        exact_groups.sort(key=lambda group: (-len(group["ids"]), group["sha256"]))
+
+        image_items = [item for item in items if item["media_type"] == "image"]
+        missing_hashes = sum(not item["phash"] for item in image_items)
+        hash_errors = 0
+        updates: list[tuple[str, int]] = []
+
+        def flush_updates() -> None:
+            if not updates:
+                return
+            with self._lock, self._connect() as db:
+                db.executemany(
+                    "UPDATE images SET phash = ? WHERE id = ?",
+                    updates,
+                )
+            updates.clear()
+
+        if progress_callback:
+            progress_callback("hashing", 0, missing_hashes, hash_errors)
+        hashed = 0
+        for item in image_items:
+            if not item["phash"]:
+                try:
+                    media_path = self.images_dir / item["filename"]
+                    if not media_path.is_file():
+                        raise OSError("media file is missing")
+                    item["phash"] = self._perceptual_hash(media_path)
+                    updates.append((item["phash"], item["id"]))
+                except Exception:
+                    hash_errors += 1
+                hashed += 1
+                if len(updates) >= 50:
+                    flush_updates()
+                if progress_callback and (
+                    hashed == missing_hashes or hashed % 5 == 0
+                ):
+                    progress_callback("hashing", hashed, missing_hashes, hash_errors)
+            if item["phash"]:
+                try:
+                    item["phash_value"] = int(item["phash"], 16)
+                except ValueError:
+                    item["phash"] = ""
+                    item["phash_value"] = None
+            else:
+                item["phash_value"] = None
+        flush_updates()
+
+        class BKTree:
+            def __init__(self):
+                self.root = None
+
+            def add(self, value, item):
+                if self.root is None:
+                    self.root = {"value": value, "items": [item], "children": {}}
+                    return
+                node = self.root
+                while True:
+                    distance = (node["value"] ^ value).bit_count()
+                    if distance == 0:
+                        node["items"].append(item)
+                        return
+                    child = node["children"].get(distance)
+                    if child is None:
+                        node["children"][distance] = {
+                            "value": value,
+                            "items": [item],
+                            "children": {},
+                        }
+                        return
+                    node = child
+
+            def search(self, value, radius):
+                if self.root is None:
+                    return
+                pending = [self.root]
+                while pending:
+                    node = pending.pop()
+                    distance = (node["value"] ^ value).bit_count()
+                    if distance <= radius:
+                        yield node, distance
+                    lower = distance - radius
+                    upper = distance + radius
+                    pending.extend(
+                        child
+                        for edge, child in node["children"].items()
+                        if lower <= edge <= upper
+                    )
+
+        tree = BKTree()
+        similar_pairs = []
+        truncated = False
+        compare_total = sum(item["phash_value"] is not None for item in image_items)
+        if progress_callback:
+            progress_callback("comparing", 0, compare_total, hash_errors)
+        compared = 0
+        for item in image_items:
+            value = item["phash_value"]
+            if value is None:
+                continue
+            for node, distance in tree.search(value, threshold):
+                for other in node["items"]:
+                    if (
+                        other["category_id"] == item["category_id"]
+                        or other["sha256"] == item["sha256"]
+                    ):
+                        continue
+                    similar_pairs.append(
+                        {
+                            "first_id": other["id"],
+                            "second_id": item["id"],
+                            "distance": distance,
+                        }
+                    )
+                    if len(similar_pairs) >= MAX_SIMILAR_CANDIDATES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+            tree.add(value, item)
+            compared += 1
+            if progress_callback and (
+                compared == compare_total or compared % 100 == 0
+            ):
+                progress_callback("comparing", compared, compare_total, hash_errors)
+        similar_pairs.sort(
+            key=lambda pair: (pair["distance"], pair["first_id"], pair["second_id"])
+        )
+        if progress_callback:
+            progress_callback("completed", compare_total, compare_total, hash_errors)
+        return {
+            "exact_groups": exact_groups,
+            "similar_pairs": similar_pairs,
+            "hash_errors": hash_errors,
+            "truncated": truncated,
+            "threshold": threshold,
+            "total_images": len(image_items),
+        }
+
+    def duplicate_media_cards(self, image_ids: list[int]) -> dict[int, dict]:
+        ids = list(dict.fromkeys(int(value) for value in image_ids))
+        if not ids:
+            return {}
+        if len(ids) > 2000:
+            ids = ids[:2000]
+        rows = []
+        with self._lock, self._connect() as db:
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    db.execute(
+                        f"""SELECT i.*, c.name AS category_name,
+                                   c.is_nsfw AS category_nsfw
+                            FROM images i JOIN categories c ON c.id = i.category_id
+                            WHERE i.id IN ({placeholders})""",
+                        chunk,
+                    ).fetchall()
+                )
+        by_id = {}
+        for row in rows:
+            path = self.images_dir / row["filename"]
+            try:
+                thumbnail_path = (
+                    self._ensure_gallery_thumbnail(path, row["media_type"])
+                    if path.is_file()
+                    else None
+                )
+            except Exception:
+                thumbnail_path = None
+            by_id[int(row["id"])] = {
+                "id": int(row["id"]),
+                "category_id": row["category_id"],
+                "category_name": row["category_name"],
+                "media_type": row["media_type"],
+                "image_format": row["image_format"],
+                "width": int(row["width"]),
+                "height": int(row["height"]),
+                "size_bytes": int(row["size_bytes"]),
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
+                "thumbnail": (
+                    self._thumbnail_data_url(thumbnail_path)
+                    if thumbnail_path is not None
+                    else ""
+                ),
+            }
+        return by_id
+
     def list_images(
         self,
         category_id: str,
         page: int = 1,
         page_size: int = 30,
         tag: str = "",
+        defer_video_thumbnails: bool = False,
     ) -> dict:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), PAGE_SIZE_MAX))
@@ -944,8 +2022,15 @@ class GalleryStore:
             tag_filter = ""
             params: list[object] = [category_id]
             if tag.strip():
-                tag_filter = " AND EXISTS (SELECT 1 FROM media_tags t WHERE t.image_id = images.id AND t.tag = ? COLLATE NOCASE)"
-                params.append(tag.strip())
+                tag_terms = self._expanded_tag_terms(db, tag)
+                tag_conditions = " OR ".join(
+                    "t.tag = ? COLLATE NOCASE" for _ in tag_terms
+                )
+                tag_filter = (
+                    " AND EXISTS (SELECT 1 FROM media_tags t "
+                    "WHERE t.image_id = images.id AND (" + tag_conditions + "))"
+                )
+                params.extend(tag_terms)
             total = db.execute(
                 f"SELECT COUNT(*) FROM images WHERE category_id = ?{tag_filter}",
                 params,
@@ -964,9 +2049,18 @@ class GalleryStore:
             if not path.is_file():
                 continue
             try:
-                thumbnail_path = self._ensure_gallery_thumbnail(
-                    path, row["media_type"]
-                )
+                if defer_video_thumbnails and row["media_type"] == "video":
+                    cached_thumbnail = self._gallery_thumbnail_path(path)
+                    if cached_thumbnail.is_file():
+                        with Image.open(cached_thumbnail) as thumbnail:
+                            thumbnail.verify()
+                        thumbnail_path = cached_thumbnail
+                    else:
+                        thumbnail_path = None
+                else:
+                    thumbnail_path = self._ensure_gallery_thumbnail(
+                        path, row["media_type"]
+                    )
             except Exception:
                 thumbnail_path = None
             items.append(
@@ -1204,6 +2298,29 @@ class GalleryStore:
                     self._now(),
                 ),
             )
+
+    def embedding_text_for_media(self, image_id: int, scope: str) -> str:
+        if scope not in {"sfw", "nsfw"}:
+            raise GalleryError("语义索引范围无效。")
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                """SELECT i.ai_description, i.description_override, i.ai_tags,
+                          i.is_nsfw, c.is_nsfw AS category_nsfw, c.id AS category_id
+                   FROM images i JOIN categories c ON c.id = i.category_id
+                   WHERE i.id = ?""",
+                (int(image_id),),
+            ).fetchone()
+        if not row:
+            raise GalleryError("找不到该媒体。")
+        is_nsfw = bool(row["is_nsfw"] or row["category_nsfw"])
+        if (scope == "nsfw") != is_nsfw or (scope == "sfw" and row["category_id"] == "pending"):
+            raise GalleryError("媒体的安全范围已变化，无法建立该语义索引。")
+        description = str(row["description_override"] or row["ai_description"] or "").strip()
+        tags = self._decode_tags(row["ai_tags"])
+        searchable_text = "\n".join(part for part in (description, " ".join(tags)) if part)
+        if not searchable_text:
+            raise GalleryError("媒体还没有可用于语义索引的描述或 AI 标签。")
+        return searchable_text
 
     def embedding_rebuild_candidates(self, scope: str) -> list[dict]:
         if scope not in {"sfw", "nsfw"}:
@@ -1530,7 +2647,11 @@ class GalleryStore:
         return self.thumbnails_dir / f"gallery-{media_path.name}.jpg"
 
     def _ensure_gallery_thumbnail(
-        self, media_path: Path, media_type: str
+        self,
+        media_path: Path,
+        media_type: str,
+        progress_callback=None,
+        cancel_check=None,
     ) -> Path | None:
         """Return a small, persistent preview thumbnail for gallery cards."""
         thumbnail_path = self._gallery_thumbnail_path(media_path)
@@ -1538,6 +2659,8 @@ class GalleryStore:
             try:
                 with Image.open(thumbnail_path) as thumbnail:
                     thumbnail.verify()
+                if progress_callback:
+                    progress_callback("video_preview", 100, "视频预览图已存在")
                 return thumbnail_path
             except Exception:
                 try:
@@ -1547,7 +2670,11 @@ class GalleryStore:
 
         source_path = media_path
         if media_type == "video":
-            source_path = self._ensure_video_thumbnail(media_path)
+            source_path = self._ensure_video_thumbnail(
+                media_path,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
             if source_path is None:
                 return None
         if not source_path.is_file():
@@ -1555,6 +2682,10 @@ class GalleryStore:
 
         temporary_path = self.thumbnails_dir / f".gallery-{uuid.uuid4().hex}.tmp"
         try:
+            if progress_callback:
+                progress_callback("video_preview", 88, "正在生成卡片缩略图")
+            if cancel_check and cancel_check("video_preview"):
+                raise ProcessingTaskCancelled("视频预览任务已取消。")
             with Image.open(source_path) as img:
                 try:
                     img.seek(0)
@@ -1573,7 +2704,11 @@ class GalleryStore:
             with Image.open(temporary_path) as thumbnail:
                 thumbnail.verify()
             os.replace(temporary_path, thumbnail_path)
+            if progress_callback:
+                progress_callback("video_preview", 100, "视频预览图已生成")
             return thumbnail_path
+        except ProcessingTaskCancelled:
+            raise
         except Exception:
             return None
         finally:
@@ -1590,80 +2725,141 @@ class GalleryStore:
     def _video_thumbnail_path(self, video_path: Path) -> Path:
         return self.thumbnails_dir / f"{video_path.stem}.jpg"
 
-    def _ensure_video_thumbnail(self, video_path: Path) -> Path | None:
+    def _ensure_video_thumbnail(
+        self,
+        video_path: Path,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> Path | None:
         thumbnail_path = self._video_thumbnail_path(video_path)
-        with self._lock:
-            if video_path.name in self._video_thumbnail_failures:
-                return None
-            if thumbnail_path.is_file():
+        if video_path.name in self._video_thumbnail_failures:
+            return None
+        if thumbnail_path.is_file():
+            try:
+                with Image.open(thumbnail_path) as thumbnail:
+                    thumbnail.verify()
+                if progress_callback:
+                    progress_callback("video_preview", 75, "视频帧预览已存在")
+                return thumbnail_path
+            except Exception:
                 try:
-                    with Image.open(thumbnail_path) as thumbnail:
-                        thumbnail.verify()
-                    return thumbnail_path
-                except Exception:
-                    try:
-                        thumbnail_path.unlink(missing_ok=True)
-                    except OSError:
-                        return None
-
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                try:
-                    import imageio_ffmpeg
-
-                    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-                except Exception:
-                    self._video_thumbnail_failures.add(video_path.name)
+                    thumbnail_path.unlink(missing_ok=True)
+                except OSError:
                     return None
 
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            for seek_seconds in ("1", "0"):
-                temporary_path = self.thumbnails_dir / f".{uuid.uuid4().hex}.jpg"
-                try:
-                    result = subprocess.run(
-                        [
-                            ffmpeg,
-                            "-nostdin",
-                            "-hide_banner",
-                            "-loglevel",
-                            "error",
-                            "-ss",
-                            seek_seconds,
-                            "-i",
-                            str(video_path),
-                            "-map",
-                            "0:v:0",
-                            "-frames:v",
-                            "1",
-                            "-vf",
-                            "scale=w='min(640,iw)':h=-2",
-                            "-an",
-                            "-q:v",
-                            "5",
-                            "-y",
-                            str(temporary_path),
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=20,
-                        check=False,
-                        creationflags=creationflags,
-                    )
-                    if result.returncode != 0 or not temporary_path.is_file():
-                        continue
-                    with Image.open(temporary_path) as thumbnail:
-                        thumbnail.verify()
-                    os.replace(temporary_path, thumbnail_path)
-                    return thumbnail_path
-                except Exception:
-                    continue
-                finally:
-                    try:
-                        temporary_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+        ffmpeg = self._ffmpeg_executable()
+        if not ffmpeg:
             self._video_thumbnail_failures.add(video_path.name)
+            if progress_callback:
+                progress_callback("video_preview", 15, "未找到可用的 FFmpeg")
+            return None
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for index, seek_seconds in enumerate(("1", "0")):
+            if cancel_check and cancel_check("video_preview"):
+                raise ProcessingTaskCancelled("视频预览任务已取消。")
+            if progress_callback:
+                progress_callback(
+                    "video_preview",
+                    15 + index * 25,
+                    f"正在截取视频帧（尝试 {index + 1}/2）",
+                )
+            temporary_path = self.thumbnails_dir / f".{uuid.uuid4().hex}.jpg"
+            try:
+                process = subprocess.Popen(
+                    [
+                        ffmpeg,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        seek_seconds,
+                        "-i",
+                        str(video_path),
+                        "-map",
+                        "0:v:0",
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=w='min(640,iw)':h=-2",
+                        "-an",
+                        "-q:v",
+                        "5",
+                        "-y",
+                        str(temporary_path),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                started = time_module.monotonic()
+                while process.poll() is None:
+                    if cancel_check and cancel_check("video_preview"):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise ProcessingTaskCancelled("视频预览任务已取消。")
+                    if time_module.monotonic() - started > 20:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        break
+                    time_module.sleep(0.15)
+                if process.returncode != 0 or not temporary_path.is_file():
+                    continue
+                with Image.open(temporary_path) as thumbnail:
+                    thumbnail.verify()
+                os.replace(temporary_path, thumbnail_path)
+                return thumbnail_path
+            except ProcessingTaskCancelled:
+                raise
+            except Exception:
+                continue
+            finally:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._video_thumbnail_failures.add(video_path.name)
         return None
+
+    def regenerate_video_preview(
+        self,
+        image_id: int,
+        progress_callback=None,
+        cancel_check=None,
+    ) -> bool:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT filename, media_type FROM images WHERE id = ?",
+                (int(image_id),),
+            ).fetchone()
+        if not row:
+            raise GalleryError("找不到该媒体。")
+        if row["media_type"] != "video":
+            raise GalleryError("该媒体不是视频，无法重建视频预览图。")
+        video_path = self.images_dir / row["filename"]
+        if not video_path.is_file():
+            raise GalleryError("视频文件不存在。")
+        self._video_thumbnail_failures.discard(video_path.name)
+        self._video_thumbnail_path(video_path).unlink(missing_ok=True)
+        self._gallery_thumbnail_path(video_path).unlink(missing_ok=True)
+        result = self._ensure_gallery_thumbnail(
+            video_path,
+            "video",
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+        if result is None:
+            raise GalleryError("FFmpeg 未能从视频生成预览图。")
+        return True
 
     def _remove_media_thumbnails(self, filename: str) -> None:
         with self._lock:
@@ -1833,16 +3029,19 @@ class GalleryStore:
             raise GalleryError("请输入 1–32 个字符的标签关键词。")
         nsfw_filter = "" if allow_nsfw else " AND i.is_nsfw = 0 AND c.is_nsfw = 0"
         with self._lock, self._connect() as db:
+            tag_terms = self._expanded_tag_terms(db, tag)
+            tag_conditions = " OR ".join(
+                "INSTR(LOWER(t.tag), LOWER(?)) > 0" for _ in tag_terms
+            )
             row = db.execute(
                 f"""SELECT i.*, c.name AS category_name
                     FROM images i JOIN categories c ON c.id = i.category_id
                     WHERE EXISTS (
                         SELECT 1 FROM media_tags t
-                        WHERE t.image_id = i.id
-                          AND INSTR(LOWER(t.tag), LOWER(?)) > 0
+                        WHERE t.image_id = i.id AND ({tag_conditions})
                     ){nsfw_filter}
                     ORDER BY RANDOM() LIMIT 1""",
-                (tag,),
+                tag_terms,
             ).fetchone()
         if not row:
             return None
@@ -1870,7 +3069,7 @@ class GalleryStore:
             "manual_tags, ai_tags, ai_description, description_override, ai_status, "
             "ai_error, ai_provider_id, ai_updated_at, trashed_at, embedding_scope, "
             "embedding_provider_id, embedding_fingerprint, embedding_dimension, "
-            "embedding_vector, embedding_created_at"
+            "embedding_vector, embedding_created_at, phash"
         )
         with self._lock, self._connect() as db:
             rows = db.execute(
@@ -1887,7 +3086,6 @@ class GalleryStore:
                    WHERE i.id IN ({placeholders})""",
                 ids,
             ).fetchall()
-            values_sql = ", ".join("?" for _ in range(28))
             for row in rows:
                 values = (
                     row["id"], row["category_id"], row["category_name"],
@@ -1900,8 +3098,9 @@ class GalleryStore:
                     row["ai_updated_at"], trashed_at, row["embedding_scope"],
                     row["embedding_provider_id"], row["embedding_fingerprint"],
                     row["embedding_dimension"], row["embedding_vector"],
-                    row["embedding_created_at"],
+                    row["embedding_created_at"], row["phash"],
                 )
+                values_sql = ", ".join("?" for _ in values)
                 db.execute(
                     f"INSERT INTO media_trash ({columns}) VALUES ({values_sql})",
                     values,
@@ -2030,8 +3229,8 @@ class GalleryStore:
                         id, category_id, filename, sha256, size_bytes, width, height,
                         image_format, source, created_at, is_nsfw, media_type,
                         manual_tags, ai_tags, ai_description, description_override,
-                        ai_status, ai_error, ai_provider_id, ai_updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ai_status, ai_error, ai_provider_id, ai_updated_at, phash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         row["original_id"], target_category_id, row["filename"],
                         row["sha256"], row["size_bytes"], row["width"], row["height"],
@@ -2040,7 +3239,7 @@ class GalleryStore:
                         json.dumps(manual_tags, ensure_ascii=False),
                         json.dumps(ai_tags, ensure_ascii=False), ai_description,
                         description_override, ai_status, ai_error, ai_provider_id,
-                        ai_updated_at,
+                        ai_updated_at, row["phash"],
                     ),
                 )
                 self._sync_tag_index(db, int(row["original_id"]), manual_tags, ai_tags)
