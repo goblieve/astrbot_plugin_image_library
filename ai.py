@@ -6,9 +6,22 @@ import inspect
 import json
 import math
 import re
+import uuid
+import warnings
+from pathlib import Path
 from typing import Any
 
-from .store import GalleryError, GalleryStore
+from PIL import Image, ImageOps
+
+from .store import (
+    GalleryError,
+    GalleryStore,
+    MAX_IMAGE_DECODE_PIXELS,
+    MAX_IMAGE_PIXELS,
+)
+
+
+MAX_EVALUATION_IMAGE_EDGE = 5000
 
 
 def _provider_config(provider: Any) -> dict[str, Any]:
@@ -153,6 +166,99 @@ def evaluation_prompt_version(custom_prompt: str) -> str:
     return f"sha256:{digest}"
 
 
+def _prepare_image_for_evaluation(
+    source_path: str | Path,
+    staging_dir: str | Path,
+) -> Path | None:
+    """Create an EXIF-corrected temporary copy only when the source is oversized."""
+    source_path = Path(source_path)
+    temporary_path: Path | None = None
+    image_copy: Image.Image | None = None
+    oriented: Image.Image | None = None
+    encoded: Image.Image | None = None
+    succeeded = False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(source_path) as source:
+                source.seek(0)
+                source_width, source_height = source.size
+                if max(source_width, source_height) <= MAX_EVALUATION_IMAGE_EDGE:
+                    return None
+                source_pixels = source_width * source_height
+                if source_pixels > MAX_IMAGE_PIXELS:
+                    raise GalleryError("图片像素超过安全处理上限，无法生成 AI 评估副本。")
+
+                image_format = str(source.format or "").upper()
+                if source_pixels > MAX_IMAGE_DECODE_PIXELS:
+                    if image_format not in {"JPEG", "MPO"}:
+                        raise GalleryError(
+                            "超大非 JPEG 图片超过安全解码上限，无法生成 AI 评估副本。"
+                        )
+                    source.draft(
+                        "RGB",
+                        (max(1, source_width // 2), max(1, source_height // 2)),
+                    )
+                    if source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
+                        raise GalleryError(
+                            "图片超过安全解码上限，无法生成 AI 评估副本。"
+                        )
+
+                icc_profile = source.info.get("icc_profile")
+                image_copy = source.copy()
+                oriented = ImageOps.exif_transpose(image_copy)
+                if oriented is not image_copy:
+                    image_copy.close()
+                image_copy = None
+                if max(oriented.size) > MAX_EVALUATION_IMAGE_EDGE:
+                    oriented.thumbnail(
+                        (MAX_EVALUATION_IMAGE_EDGE, MAX_EVALUATION_IMAGE_EDGE),
+                        Image.Resampling.LANCZOS,
+                    )
+                has_alpha = "A" in oriented.getbands() or "transparency" in oriented.info
+                exif = oriented.getexif().tobytes()
+                save_options: dict[str, Any]
+                if has_alpha:
+                    encoded = oriented.convert("RGBA")
+                    temporary_path = Path(staging_dir) / (
+                        f"ai-evaluation-{uuid.uuid4().hex}.png"
+                    )
+                    save_options = {"format": "PNG", "optimize": True}
+                else:
+                    encoded = oriented.convert("RGB")
+                    temporary_path = Path(staging_dir) / (
+                        f"ai-evaluation-{uuid.uuid4().hex}.jpg"
+                    )
+                    save_options = {
+                        "format": "JPEG",
+                        "quality": 90,
+                        "optimize": True,
+                        "progressive": True,
+                    }
+                if exif:
+                    save_options["exif"] = exif
+                if icc_profile:
+                    save_options["icc_profile"] = icc_profile
+                encoded.save(temporary_path, **save_options)
+        succeeded = True
+        return temporary_path
+    except GalleryError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise GalleryError("图片像素超过安全处理上限，无法生成 AI 评估副本。") from exc
+    except Exception as exc:
+        raise GalleryError("生成 AI 评估图片副本失败。") from exc
+    finally:
+        if image_copy is not None:
+            image_copy.close()
+        if oriented is not None:
+            oriented.close()
+        if encoded is not None:
+            encoded.close()
+        if temporary_path is not None and not succeeded:
+            temporary_path.unlink(missing_ok=True)
+
+
 class MediaAI:
     def __init__(
         self,
@@ -196,6 +302,7 @@ class MediaAI:
             chat_provider_id,
         )
         frames: list[Any] = []
+        evaluation_image_copy: Path | None = None
         try:
             if media["media_type"] == "video":
                 frames = await asyncio.to_thread(
@@ -203,7 +310,14 @@ class MediaAI:
                 )
                 image_inputs = [str(path) for path in frames]
             else:
-                image_inputs = [str(media["path"])]
+                evaluation_image_copy = await asyncio.to_thread(
+                    _prepare_image_for_evaluation,
+                    media["path"],
+                    self.store.staging_dir,
+                )
+                image_inputs = [
+                    str(evaluation_image_copy or media["path"])
+                ]
             custom_prompt = (
                 self.nsfw_evaluation_prompt
                 if scope == "nsfw"
@@ -241,6 +355,8 @@ class MediaAI:
         finally:
             if frames:
                 self.store.cleanup_video_frames(frames)
+            if evaluation_image_copy is not None:
+                evaluation_image_copy.unlink(missing_ok=True)
 
         return {
             "image_id": int(image_id),

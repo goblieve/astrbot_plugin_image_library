@@ -19,6 +19,7 @@
           <button class="button secondary" id="openTaskCenterButton" type="button">
             AI 处理任务中心 <span class="task-center-badge" id="taskCenterBadge" hidden>0</span>
           </button>
+          <button class="button secondary" id="openMirageButton" type="button">幻影坦克制作</button>
           <button class="button secondary" id="refreshButton" type="button">刷新</button>
         </div>
       </header>
@@ -38,7 +39,7 @@
           <button class="button secondary" id="duplicateCheckButton" type="button">重复项检查</button>
           <button class="button primary" id="uploadButton" type="button">批量导入</button>
         </div>
-        <p class="hint toolbar-hint">支持 JPG、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM；重复文件会自动跳过。多文件按顺序导入。</p>
+        <p class="hint toolbar-hint">支持 JPG、MPO、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM；MPO 导入会提取主画面转为 JPEG。重复文件自动跳过，多文件按顺序导入。</p>
       </section>
 
       <section class="panel search-panel" id="activeSearchPanel" aria-label="语义检索与 NSFW 评估">
@@ -265,6 +266,151 @@
           <strong>还没有处理任务</strong>
           <span>媒体进入压缩、预览、AI 评估或语义索引流程后会显示在这里。</span>
         </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop mirage-backdrop" id="mirageModal" hidden>
+      <section class="mirage-modal" role="dialog" aria-modal="true" aria-labelledby="mirageTitle">
+        <div class="mirage-heading">
+          <div>
+            <p class="eyebrow">COLORED MIRAGE</p>
+            <h2 id="mirageTitle">幻影坦克制作</h2>
+            <p class="hint">表图在左、里图在右。表图决定白底效果，里图决定黑底效果；两图按表图比例裁切对齐，生成带透明通道的 PNG。</p>
+          </div>
+          <div class="mirage-heading-actions">
+            <button class="button secondary" id="useSelectedMirageButton" type="button" title="按图库勾选顺序：先表图，后里图">使用当前选中的两张图</button>
+            <button class="icon-button" id="closeMirageButton" type="button" aria-label="关闭幻影坦克制作">×</button>
+          </div>
+        </div>
+
+        <div class="mirage-source-fields">
+          <label class="mirage-id-field" for="mirageCoverIdInput">
+            <span>表图编号（外层）</span>
+            <input class="text-input" id="mirageCoverIdInput" type="number" min="1" step="1" placeholder="图库媒体编号" />
+          </label>
+          <label class="mirage-id-field" for="mirageInnerIdInput">
+            <span>里图编号（内层）</span>
+            <input class="text-input" id="mirageInnerIdInput" type="number" min="1" step="1" placeholder="图库媒体编号" />
+          </label>
+          <button class="button primary" id="loadMirageSourcesButton" type="button">载入两张图片</button>
+          <button class="button secondary" id="swapMirageImagesButton" type="button">互换里图/表图</button>
+        </div>
+
+        <div class="mirage-picker-layout">
+          <section class="mirage-picker-panel">
+            <div class="mirage-picker-heading">
+              <h3>从分类缩略图选表图</h3>
+              <label for="mirageCoverPickerCategory">分类
+                <select id="mirageCoverPickerCategory" aria-label="选择表图来源分类"></select>
+              </label>
+            </div>
+            <div class="mirage-image-picker" id="mirageCoverPickerGrid" aria-label="表图缩略图"></div>
+            <div class="mirage-picker-pagination">
+              <button class="button secondary" id="mirageCoverPickerPrevious" type="button">上一页</button>
+              <span class="hint" id="mirageCoverPickerPage">第 1 / 1 页</span>
+              <button class="button secondary" id="mirageCoverPickerNext" type="button">下一页</button>
+            </div>
+          </section>
+          <section class="mirage-picker-panel">
+            <div class="mirage-picker-heading">
+              <h3>从分类缩略图选里图</h3>
+              <label for="mirageInnerPickerCategory">分类
+                <select id="mirageInnerPickerCategory" aria-label="选择里图来源分类"></select>
+              </label>
+            </div>
+            <div class="mirage-image-picker" id="mirageInnerPickerGrid" aria-label="里图缩略图"></div>
+            <div class="mirage-picker-pagination">
+              <button class="button secondary" id="mirageInnerPickerPrevious" type="button">上一页</button>
+              <span class="hint" id="mirageInnerPickerPage">第 1 / 1 页</span>
+              <button class="button secondary" id="mirageInnerPickerNext" type="button">下一页</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="mirage-source-grid">
+          <section class="mirage-source-card">
+            <h3>表图 · 外层</h3>
+            <img id="mirageCoverPreview" alt="表图预览" hidden />
+            <p class="hint" id="mirageCoverMeta">尚未载入图片</p>
+          </section>
+          <section class="mirage-source-card">
+            <h3>里图 · 内层</h3>
+            <img id="mirageInnerPreview" alt="里图预览" hidden />
+            <p class="hint" id="mirageInnerMeta">尚未载入图片</p>
+          </section>
+        </div>
+        <p class="hint mirage-status" id="mirageStatus" role="status" aria-live="polite">可输入图库编号，或先在图集中勾选两张图片后打开此工具。</p>
+
+        <section class="mirage-parameters">
+          <div class="mirage-section-heading">
+            <div>
+              <h3>像素参数</h3>
+              <p class="hint">预览会随参数即时更新；输出最长边限制为 1200 像素，以控制浏览器内存占用。</p>
+              <p class="hint" id="mirageSettingsStatus">参数会自动保存到插件数据，下次打开继续使用。</p>
+            </div>
+          </div>
+          <div class="mirage-controls">
+            <label class="mirage-control">
+              <span>输出最长边</span>
+              <output id="mirageMaxSizeValue" for="mirageMaxSizeInput">1200 px</output>
+              <input id="mirageMaxSizeInput" type="range" min="240" max="1200" step="80" value="1200" />
+            </label>
+            <label class="mirage-control">
+              <span>里图亮度比例</span>
+              <output id="mirageInnerScaleValue" for="mirageInnerScaleInput">0.30</output>
+              <input id="mirageInnerScaleInput" type="range" min="0" max="1" step="0.01" value="0.30" />
+            </label>
+            <label class="mirage-control">
+              <span>表图向白色偏移</span>
+              <output id="mirageCoverScaleValue" for="mirageCoverScaleInput">0.20</output>
+              <input id="mirageCoverScaleInput" type="range" min="0" max="1" step="0.01" value="0.20" />
+            </label>
+            <label class="mirage-control">
+              <span>里图去色</span>
+              <output id="mirageInnerDesatValue" for="mirageInnerDesatInput">0.00</output>
+              <input id="mirageInnerDesatInput" type="range" min="0" max="1" step="0.01" value="0" />
+            </label>
+            <label class="mirage-control">
+              <span>表图去色</span>
+              <output id="mirageCoverDesatValue" for="mirageCoverDesatInput">0.00</output>
+              <input id="mirageCoverDesatInput" type="range" min="0" max="1" step="0.01" value="0" />
+            </label>
+            <label class="mirage-control">
+              <span>里图颜色权重</span>
+              <output id="mirageWeightValue" for="mirageWeightInput">0.70</output>
+              <input id="mirageWeightInput" type="range" min="0" max="1" step="0.01" value="0.70" />
+            </label>
+          </div>
+          <label class="check-row mirage-colored-row">
+            <input id="mirageColoredInput" type="checkbox" checked />
+            彩色模式
+          </label>
+        </section>
+
+        <div class="mirage-output-heading">
+          <h3>效果预览</h3>
+          <span class="hint" id="mirageOutputMeta">载入图片后生成预览</span>
+        </div>
+        <div class="mirage-output-grid">
+          <section class="mirage-output-card">
+            <h4>白底效果（表图）</h4>
+            <div class="mirage-output-surface white"><canvas id="mirageWhiteCanvas"></canvas></div>
+          </section>
+          <section class="mirage-output-card">
+            <h4>黑底效果（里图）</h4>
+            <div class="mirage-output-surface black"><canvas id="mirageBlackCanvas"></canvas></div>
+          </section>
+        </div>
+
+        <div class="mirage-save-row">
+          <label class="mirage-category-field" for="mirageCategorySelect">
+            <span>保存到分类</span>
+            <select id="mirageCategorySelect" aria-label="幻影坦克成品分类"></select>
+          </label>
+          <button class="button primary" id="saveMirageButton" type="button" disabled>保存 PNG 到图库</button>
+        </div>
+        <p class="hint mirage-size-hint" id="mirageSizeHint">超出图库入库体积上限时，请降低输出最长边后重新预览；为保留透明像素，不会对成品再做有损压缩。</p>
+        <canvas id="mirageRawCanvas" hidden></canvas>
       </section>
     </div>
 

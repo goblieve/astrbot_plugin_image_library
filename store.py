@@ -13,10 +13,12 @@ import threading
 import time as time_module
 import uuid
 import warnings
+from collections import OrderedDict
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageOps, ImageSequence, features
+from PIL import Image, ImageMath, ImageOps, ImageSequence, features
 
 
 DEFAULT_CATEGORIES = (
@@ -26,7 +28,7 @@ DEFAULT_CATEGORIES = (
     ("meme", "梗图", False),
     ("nsfw", "NSFW", True),
 )
-ALLOWED_FORMATS = {"JPEG", "PNG", "GIF", "WEBP", "BMP"}
+ALLOWED_FORMATS = {"JPEG", "MPO", "PNG", "GIF", "WEBP", "BMP"}
 VIDEO_SUFFIXES = {
     "MP4": ".mp4",
     "MOV": ".mov",
@@ -87,6 +89,9 @@ class GalleryStore:
         )
         self._lock = threading.RLock()
         self._video_thumbnail_failures: set[str] = set()
+        self._mirage_preview_cache: OrderedDict[tuple[int, int, int], tuple[str, int, int]] = OrderedDict()
+        self._mirage_preview_cache_bytes = 0
+        self._mirage_preview_cache_limit = 8 * 1024 * 1024
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.thumbnails_dir.mkdir(parents=True, exist_ok=True)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -203,6 +208,11 @@ class GalleryStore:
                     ON media_trash(trashed_at DESC, trash_id DESC);
                 CREATE TABLE IF NOT EXISTS deleted_builtin_categories (
                     id TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS plugin_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS processing_tasks (
                     task_id TEXT PRIMARY KEY,
@@ -466,10 +476,7 @@ class GalleryStore:
                           EXISTS (SELECT 1 FROM processing_tasks retry
                                   WHERE retry.retry_of = t.task_id) AS has_retry
                    FROM processing_tasks t LEFT JOIN images i ON i.id = t.media_id
-                   ORDER BY CASE t.status
-                     WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'failed' THEN 2
-                     WHEN 'cancelled' THEN 3 ELSE 4 END,
-                     t.created_at DESC, t.rowid DESC LIMIT ?""",
+                   ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         result = []
@@ -1053,6 +1060,51 @@ class GalleryStore:
                 return existing
             raise
 
+    def ensure_nsfw_category(self, name: str) -> dict:
+        name = str(name).strip()
+        category = self.category_by_name(name)
+        if not category:
+            try:
+                return self.create_category(name, is_nsfw=True)
+            except GalleryError:
+                category = self.category_by_name(name)
+                if not category:
+                    raise
+        if category["is_nsfw"]:
+            return category
+
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT id FROM categories WHERE id = ?", (category["id"],)
+            ).fetchone()
+            if not row:
+                raise GalleryError("找不到目标分类。")
+            db.execute(
+                "UPDATE categories SET is_nsfw = 1 WHERE id = ?",
+                (category["id"],),
+            )
+            db.execute(
+                "UPDATE images SET is_nsfw = 1 WHERE category_id = ?",
+                (category["id"],),
+            )
+            db.execute(
+                """UPDATE media_embeddings SET scope = 'nsfw'
+                   WHERE image_id IN (
+                       SELECT id FROM images WHERE category_id = ?
+                   )""",
+                (category["id"],),
+            )
+            db.execute(
+                """UPDATE media_trash SET is_nsfw = 1,
+                       embedding_scope = CASE
+                           WHEN embedding_vector IS NOT NULL THEN 'nsfw'
+                           ELSE embedding_scope
+                       END
+                   WHERE category_id = ?""",
+                (category["id"],),
+            )
+        return self.category_by_id(category["id"]) or {}
+
     def delete_category(self, category_id: str) -> dict:
         if str(category_id) == "pending":
             raise GalleryError("“待处理”是媒体回收分类，不能删除。")
@@ -1130,7 +1182,7 @@ class GalleryStore:
                     image_format = str(img.format or "").upper()
                     width, height = img.size
                     if image_format not in ALLOWED_FORMATS:
-                        raise GalleryError("仅支持 JPG、PNG、GIF、WebP 和 BMP 图片。")
+                        raise GalleryError("仅支持 JPG、MPO、PNG、GIF、WebP 和 BMP 图片。")
                     if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
                         raise GalleryError("图片尺寸过大，无法安全处理。")
                     img.verify()
@@ -1141,6 +1193,59 @@ class GalleryStore:
         except Exception as exc:
             raise GalleryError("文件不是有效的受支持图片。") from exc
         return image_format, width, height, size
+
+    def _normalize_mpo_to_jpeg(self, path: Path) -> bool:
+        """Extract an MPO's primary picture and replace it with a standard JPEG."""
+        temporary_path = self.staging_dir / f"mpo-normalized-{uuid.uuid4().hex}.jpg"
+        frame: Image.Image | None = None
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(path) as source:
+                    if str(source.format or "").upper() != "MPO":
+                        return False
+                    source_pixels = source.width * source.height
+                    if (
+                        source.width <= 0
+                        or source.height <= 0
+                        or source_pixels > MAX_IMAGE_PIXELS
+                    ):
+                        raise GalleryError("MPO 主画面尺寸超过图片安全上限。")
+                    source.seek(0)
+                    if source_pixels > MAX_IMAGE_DECODE_PIXELS:
+                        source.draft(
+                            "RGB",
+                            (max(1, source.width // 2), max(1, source.height // 2)),
+                        )
+                        if source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
+                            raise GalleryError(
+                                "MPO 主画面超过安全解码上限，请先缩小后再导入。"
+                            )
+                    icc_profile = source.info.get("icc_profile")
+                    frame = ImageOps.exif_transpose(source.copy()).convert("RGB")
+                    save_options: dict[str, object] = {
+                        "format": "JPEG",
+                        "quality": 95,
+                        "optimize": True,
+                    }
+                    exif = frame.getexif().tobytes()
+                    if exif:
+                        save_options["exif"] = exif
+                    if icc_profile:
+                        save_options["icc_profile"] = icc_profile
+                    frame.save(temporary_path, **save_options)
+            os.replace(temporary_path, path)
+            return True
+        except GalleryError:
+            raise
+        except Image.DecompressionBombError as exc:
+            raise GalleryError("MPO 主画面像素超过安全处理上限。") from exc
+        except Exception as exc:
+            raise GalleryError("MPO 主画面转为标准 JPEG 失败。") from exc
+        finally:
+            if frame is not None:
+                frame.close()
+            temporary_path.unlink(missing_ok=True)
 
     def _inspect_video(
         self, path: Path, max_bytes: int | None = None
@@ -1601,6 +1706,7 @@ class GalleryStore:
                 raise ProcessingTaskCancelled("压缩任务已取消。")
             shutil.copyfile(source_path, staging_path)
             source_size = staging_path.stat().st_size
+            original_size_bytes = source_size
             if source_size > source_limit_bytes:
                 limit_mb = source_limit_bytes // (1024 * 1024)
                 media_label = "视频" if media_type == "video" else "图片"
@@ -1623,7 +1729,13 @@ class GalleryStore:
                 media_format, width, height, size = self._inspect_video(prepared_path)
                 suffix = VIDEO_SUFFIXES[media_format]
             else:
-                self._inspect_image(staging_path, self.max_source_image_bytes)
+                image_format, _, _, _ = self._inspect_image(
+                    staging_path, self.max_source_image_bytes
+                )
+                if image_format == "MPO":
+                    self._normalize_mpo_to_jpeg(staging_path)
+                    source_size = staging_path.stat().st_size
+                    self._inspect_image(staging_path, self.max_source_image_bytes)
                 if source_size > target_bytes:
                     if progress_callback:
                         progress_callback("compression", 20, "图片检查完成，开始压缩")
@@ -1666,7 +1778,7 @@ class GalleryStore:
                         "duplicate": True,
                         "filename": existing["filename"],
                         "size_bytes": existing["size_bytes"],
-                        "original_size_bytes": source_size,
+                        "original_size_bytes": original_size_bytes,
                         "compressed": compressed,
                         "width": existing["width"],
                         "height": existing["height"],
@@ -1748,7 +1860,7 @@ class GalleryStore:
                 "duplicate": False,
                 "filename": filename,
                 "size_bytes": size,
-                "original_size_bytes": source_size,
+                "original_size_bytes": original_size_bytes,
                 "compressed": compressed,
                 "width": width,
                 "height": height,
@@ -2009,9 +2121,14 @@ class GalleryStore:
         page_size: int = 30,
         tag: str = "",
         defer_video_thumbnails: bool = False,
+        media_type: str = "",
     ) -> dict:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), PAGE_SIZE_MAX))
+        media_type = str(media_type or "").strip().lower()
+        if media_type not in {"", "image", "video"}:
+            raise GalleryError("媒体类型筛选无效。")
+        media_filter = " AND media_type = ?" if media_type else ""
         offset = (page - 1) * page_size
         with self._lock, self._connect() as db:
             category = db.execute(
@@ -2031,15 +2148,17 @@ class GalleryStore:
                     "WHERE t.image_id = images.id AND (" + tag_conditions + "))"
                 )
                 params.extend(tag_terms)
+            if media_type:
+                params.append(media_type)
             total = db.execute(
-                f"SELECT COUNT(*) FROM images WHERE category_id = ?{tag_filter}",
+                f"SELECT COUNT(*) FROM images WHERE category_id = ?{tag_filter}{media_filter}",
                 params,
             ).fetchone()[0]
             rows = db.execute(
                 f"""SELECT images.*,
                           (SELECT provider_id FROM media_embeddings WHERE image_id = images.id)
                             AS vector_provider_id
-                   FROM images WHERE category_id = ?{tag_filter}
+                   FROM images WHERE category_id = ?{tag_filter}{media_filter}
                    ORDER BY id DESC LIMIT ? OFFSET ?""",
                 [*params, page_size, offset],
             ).fetchall()
@@ -2100,6 +2219,534 @@ class GalleryStore:
             "page_size": page_size,
             "total": total,
             "pages": max(1, (total + page_size - 1) // page_size),
+        }
+
+    @staticmethod
+    def _normalize_mirage_settings(settings: dict) -> dict:
+        defaults = {
+            "maxSize": 1200,
+            "scaleInner": 0.3,
+            "scaleCover": 0.2,
+            "desatInner": 0.0,
+            "desatCover": 0.0,
+            "weightInner": 0.7,
+            "colored": True,
+        }
+        if not isinstance(settings, dict):
+            raise GalleryError("幻影坦克参数格式无效。")
+
+        normalized = {}
+        for key in ("scaleInner", "scaleCover", "desatInner", "desatCover", "weightInner"):
+            try:
+                value = float(settings.get(key, defaults[key]))
+            except (TypeError, ValueError):
+                value = defaults[key]
+            if not math.isfinite(value):
+                value = defaults[key]
+            normalized[key] = min(1.0, max(0.0, value))
+
+        try:
+            max_size_value = float(settings.get("maxSize", defaults["maxSize"]))
+            max_size = (
+                int(round(max_size_value))
+                if math.isfinite(max_size_value)
+                else defaults["maxSize"]
+            )
+        except (TypeError, ValueError, OverflowError):
+            max_size = defaults["maxSize"]
+        max_size = min(1200, max(240, max_size))
+        normalized["maxSize"] = min(
+            1200,
+            max(240, 240 + round((max_size - 240) / 80) * 80),
+        )
+        colored = settings.get("colored", defaults["colored"])
+        normalized["colored"] = colored if isinstance(colored, bool) else defaults["colored"]
+        return normalized
+
+    def get_mirage_settings(self) -> dict:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT setting_value FROM plugin_settings WHERE setting_key = ?",
+                ("mirage",),
+            ).fetchone()
+        if not row:
+            return self._normalize_mirage_settings({})
+        try:
+            settings = json.loads(row["setting_value"])
+        except (TypeError, ValueError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        return self._normalize_mirage_settings(settings)
+
+    def save_mirage_settings(self, settings: dict) -> dict:
+        normalized = self._normalize_mirage_settings(settings)
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO plugin_settings (setting_key, setting_value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(setting_key) DO UPDATE SET
+                       setting_value = excluded.setting_value,
+                       updated_at = excluded.updated_at""",
+                ("mirage", json.dumps(normalized, ensure_ascii=False), self._now()),
+            )
+        return normalized
+
+    def get_mirage_chat_sources(
+        self, cover_id: int, inner_id: int, *, allow_nsfw: bool = False
+    ) -> dict:
+        """Validate two confirmed gallery image sources for chat generation."""
+        try:
+            cover_id = int(cover_id)
+            inner_id = int(inner_id)
+        except (TypeError, ValueError) as exc:
+            raise GalleryError("表图和里图编号必须是有效的媒体编号。") from exc
+        if cover_id <= 0 or inner_id <= 0:
+            raise GalleryError("表图和里图编号必须是正整数。")
+        if cover_id == inner_id:
+            raise GalleryError("表图和里图需要选择两张不同的图片。")
+
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                """SELECT i.id, i.filename, i.media_type, i.category_id,
+                          i.is_nsfw, c.name AS category_name,
+                          c.is_nsfw AS category_nsfw
+                   FROM images i JOIN categories c ON c.id = i.category_id
+                   WHERE i.id IN (?, ?)""",
+                (cover_id, inner_id),
+            ).fetchall()
+        by_id = {int(row["id"]): row for row in rows}
+        if len(by_id) != 2:
+            raise GalleryError("找不到表图或里图，请检查媒体编号，或确认媒体没有进入回收站。")
+
+        result = {}
+        for role, image_id in (("cover", cover_id), ("inner", inner_id)):
+            row = by_id[image_id]
+            role_name = "表图" if role == "cover" else "里图"
+            if row["media_type"] != "image":
+                raise GalleryError(f"{role_name}编号 {image_id} 是视频；幻影坦克只支持图片。")
+            if row["category_id"] == "pending":
+                raise GalleryError("待处理分类尚未确认安全范围，不能用于聊天生成；请先将来源图片移入普通分类。")
+            if (row["is_nsfw"] or row["category_nsfw"]) and not allow_nsfw:
+                raise GalleryError("该来源属于 NSFW 媒体；请使用有 NSFW 权限的管理员账号。")
+            media_path = self.images_dir / row["filename"]
+            if not media_path.is_file():
+                raise GalleryError(f"图库图片编号 {image_id} 的文件不存在。")
+            result[role] = {
+                "id": image_id,
+                "path": media_path,
+                "category_id": row["category_id"],
+                "category_name": row["category_name"],
+            }
+        return result
+
+    @staticmethod
+    def _load_mirage_generation_frame(path: Path, max_size: int) -> Image.Image:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(path) as source:
+                    image_format = str(source.format or "").upper()
+                    source_pixels = source.width * source.height
+                    if image_format not in ALLOWED_FORMATS:
+                        raise GalleryError("幻影坦克来源图片格式不受支持。")
+                    if (
+                        source.width <= 0
+                        or source.height <= 0
+                        or source_pixels > MAX_IMAGE_PIXELS
+                    ):
+                        raise GalleryError("幻影坦克来源图片尺寸超过安全处理上限。")
+                    try:
+                        source.seek(0)
+                    except EOFError:
+                        pass
+                    if source_pixels > max_size * max_size * 4:
+                        if image_format == "JPEG":
+                            source.draft("RGB", (max_size, max_size))
+                            if source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
+                                raise GalleryError(
+                                    "当前 Pillow 无法安全降采样这张超大 JPEG，请先缩小后再制作。"
+                                )
+                        elif source_pixels > MAX_IMAGE_DECODE_PIXELS:
+                            raise GalleryError(
+                                "超大非 JPEG 来源图片超过安全解码上限，请先缩小后再制作。"
+                            )
+                    frame = ImageOps.exif_transpose(source.copy())
+                    rgba = frame.convert("RGBA")
+                    rgb = Image.new("RGB", rgba.size, "white")
+                    rgb.paste(rgba.convert("RGB"), mask=rgba.getchannel("A"))
+                    return rgb
+        except GalleryError:
+            raise
+        except Image.DecompressionBombError as exc:
+            raise GalleryError("幻影坦克来源图片像素超过安全处理上限。") from exc
+        except Exception as exc:
+            raise GalleryError("幻影坦克来源图片读取失败。") from exc
+
+    def create_mirage_png(
+        self,
+        cover_id: int,
+        inner_id: int,
+        output_path: str | Path,
+        settings: dict | None = None,
+        *,
+        allow_nsfw: bool = False,
+    ) -> dict:
+        sources = self.get_mirage_chat_sources(
+            cover_id, inner_id, allow_nsfw=allow_nsfw
+        )
+        return self.create_mirage_png_from_paths(
+            sources["cover"]["path"],
+            sources["inner"]["path"],
+            output_path,
+            settings,
+        )
+
+    def create_mirage_png_from_paths(
+        self,
+        cover_path: str | Path,
+        inner_path: str | Path,
+        output_path: str | Path,
+        settings: dict | None = None,
+    ) -> dict:
+        """Render a transparent phantom-tank PNG from local image files."""
+        cover_path = Path(cover_path)
+        inner_path = Path(inner_path)
+        for source_path in (cover_path, inner_path):
+            if not source_path.is_file():
+                raise GalleryError("找不到表图或里图文件。")
+            try:
+                source_bytes = source_path.stat().st_size
+            except OSError as exc:
+                raise GalleryError("表图或里图文件无法读取。") from exc
+            if source_bytes > self.max_source_image_bytes:
+                limit_mb = self.max_source_image_bytes // (1024 * 1024)
+                raise GalleryError(f"单张来源图片不能超过接收上限 {limit_mb} MB。")
+
+        options = self._normalize_mirage_settings(
+            settings if isinstance(settings, dict) else self.get_mirage_settings()
+        )
+        max_size = options["maxSize"]
+        inner_source = self._load_mirage_generation_frame(inner_path, max_size)
+        cover_source = self._load_mirage_generation_frame(cover_path, max_size)
+
+        if cover_source.width >= cover_source.height:
+            width = max_size
+            height = max(1, math.ceil(cover_source.height * max_size / cover_source.width))
+        else:
+            height = max_size
+            width = max(1, math.ceil(cover_source.width * max_size / cover_source.height))
+        # Inner pixels are revealed on black; cover pixels are revealed on white.
+        inner = ImageOps.fit(
+            inner_source,
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        cover = cover_source.resize((width, height), Image.Resampling.LANCZOS)
+        inner_gray = inner.convert("L")
+        cover_gray = cover.convert("L")
+        scale_inner = options["scaleInner"]
+        scale_cover = 1.0 - options["scaleCover"]
+        desat_inner = options["desatInner"]
+        desat_cover = options["desatCover"]
+        weight_inner = options["weightInner"]
+
+        def evaluate(function, **images):
+            return ImageMath.lambda_eval(function, **images)
+
+        if options["colored"]:
+            alpha_float = evaluate(
+                lambda args: args["min"](
+                    args["max"](
+                        args["float"](args["inner_gray"]) * scale_inner
+                        + (255.0 - args["float"](args["cover_gray"])) * scale_cover,
+                        0.0,
+                    ),
+                    255.0,
+                ),
+                inner_gray=inner_gray,
+                cover_gray=cover_gray,
+            )
+            inner_prepared = []
+            cover_prepared = []
+            for channel in range(3):
+                inner_channel = inner.getchannel(channel)
+                cover_channel = cover.getchannel(channel)
+                inner_prepared.append(
+                    evaluate(
+                        lambda args: args["convert"](
+                            args["float"](args["channel"]) * scale_inner * (1.0 - desat_inner)
+                            + args["float"](args["gray"]) * scale_inner * desat_inner,
+                            "L",
+                        ),
+                        channel=inner_channel,
+                        gray=inner_gray,
+                    )
+                )
+                cover_prepared.append(
+                    evaluate(
+                        lambda args: args["convert"](
+                            (
+                                255.0
+                                - (255.0 - args["float"](args["channel"])) * scale_cover
+                            ) * (1.0 - desat_cover)
+                            + (
+                                255.0
+                                - (255.0 - args["float"](args["gray"])) * scale_cover
+                            ) * desat_cover,
+                            "L",
+                        ),
+                        channel=cover_channel,
+                        gray=cover_gray,
+                    )
+                )
+
+            denominator = evaluate(
+                lambda args: args["max"](
+                    args["alpha"] / 255.0,
+                    1.0 / 255.0,
+                ),
+                alpha=alpha_float,
+            )
+            output_channels = []
+            for inner_channel, cover_channel in zip(inner_prepared, cover_prepared):
+                output_channels.append(
+                    evaluate(
+                        lambda args: args["convert"](
+                            args["min"](
+                                args["max"](
+                                    (
+                                        (
+                                            args["float"](args["inner"])
+                                            - args["alpha"]
+                                            + 255.0
+                                            - args["float"](args["cover"])
+                                        ) * weight_inner
+                                        + args["alpha"]
+                                        - 255.0
+                                        + args["float"](args["cover"])
+                                    ) / args["denominator"],
+                                    0.0,
+                                ),
+                                255.0,
+                            ),
+                            "L",
+                        ),
+                        inner=inner_channel,
+                        cover=cover_channel,
+                        alpha=alpha_float,
+                        denominator=denominator,
+                    )
+                )
+            alpha = evaluate(
+                lambda args: args["convert"](args["alpha"], "L"),
+                alpha=alpha_float,
+            )
+            result = Image.merge("RGBA", (*output_channels, alpha))
+        else:
+            inner_luminance = evaluate(
+                lambda args: args["float"](args["gray"]) * scale_inner,
+                gray=inner_gray,
+            )
+            cover_luminance = evaluate(
+                lambda args: 255.0
+                - (255.0 - args["float"](args["gray"])) * scale_cover,
+                gray=cover_gray,
+            )
+            alpha_float = evaluate(
+                lambda args: args["min"](
+                    args["max"](
+                        255.0 + args["inner_luminance"] - args["cover_luminance"],
+                        0.0,
+                    ),
+                    255.0,
+                ),
+                inner_luminance=inner_luminance,
+                cover_luminance=cover_luminance,
+            )
+            denominator = evaluate(
+                lambda args: args["max"](
+                    args["alpha"] / 255.0,
+                    1.0 / 255.0,
+                ),
+                alpha=alpha_float,
+            )
+            luminance = evaluate(
+                lambda args: args["convert"](
+                    args["min"](
+                        args["max"](
+                            args["inner_luminance"] * 255.0 / args["denominator"],
+                            0.0,
+                        ),
+                        255.0,
+                    ),
+                    "L",
+                ),
+                inner_luminance=inner_luminance,
+                denominator=denominator,
+            )
+            alpha = evaluate(
+                lambda args: args["convert"](args["alpha"], "L"),
+                alpha=alpha_float,
+            )
+            result = Image.merge("RGBA", (luminance, luminance, luminance, alpha))
+
+        output_path = Path(output_path)
+        try:
+            result.save(output_path, format="PNG", compress_level=6)
+            size_bytes = output_path.stat().st_size
+        except Exception as exc:
+            raise GalleryError("幻影坦克 PNG 写入失败。") from exc
+        if size_bytes > self.max_image_bytes:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            actual_mb = size_bytes / (1024 * 1024)
+            limit_mb = self.max_image_bytes / (1024 * 1024)
+            raise GalleryError(
+                f"生成 PNG 为 {actual_mb:.1f} MB，超过图片入库上限 {limit_mb:.1f} MB；"
+                "请在管理页调低输出最长边后重试。"
+            )
+        return {"width": width, "height": height, "size_bytes": size_bytes}
+
+    def get_mirage_source(self, image_id: int, max_edge: int = 1200) -> dict:
+        """Return a bounded, orientation-corrected preview for phantom-tank creation."""
+        try:
+            image_id = int(image_id)
+        except (TypeError, ValueError) as exc:
+            raise GalleryError("图片编号无效。") from exc
+        if image_id <= 0:
+            raise GalleryError("图片编号无效。")
+        max_edge = max(256, min(int(max_edge), 1200))
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                """SELECT i.*, c.name AS category_name, c.is_nsfw AS category_nsfw
+                   FROM images i JOIN categories c ON c.id = i.category_id
+                   WHERE i.id = ?""",
+                (image_id,),
+            ).fetchone()
+        if not row:
+            raise GalleryError("找不到该图片，或该媒体已在回收站。")
+        if row["media_type"] != "image":
+            raise GalleryError("幻影坦克制作只支持图片，不能使用视频。")
+        path = self.images_dir / row["filename"]
+        if not path.is_file():
+            raise GalleryError("图片文件不存在。")
+        try:
+            file_stat = path.stat()
+        except OSError as exc:
+            raise GalleryError("图片文件无法读取。") from exc
+        cache_key = (image_id, file_stat.st_size, file_stat.st_mtime_ns)
+        with self._lock:
+            cached_preview = self._mirage_preview_cache.get(cache_key)
+            if cached_preview is not None:
+                self._mirage_preview_cache.move_to_end(cache_key)
+        if cached_preview is not None:
+            data_url, preview_width, preview_height = cached_preview
+            return {
+                "id": row["id"],
+                "category_id": row["category_id"],
+                "category_name": row["category_name"],
+                "width": row["width"],
+                "height": row["height"],
+                "preview_width": preview_width,
+                "preview_height": preview_height,
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
+                "data_url": data_url,
+                "max_image_bytes": self.max_image_bytes,
+            }
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(path) as source:
+                    image_format = str(source.format or "").upper()
+                    source_pixels = source.width * source.height
+                    if image_format not in ALLOWED_FORMATS:
+                        raise GalleryError("图片格式不受支持。")
+                    if (
+                        source.width <= 0
+                        or source.height <= 0
+                        or source_pixels > MAX_IMAGE_PIXELS
+                    ):
+                        raise GalleryError("图片尺寸超过安全处理上限。")
+                    try:
+                        source.seek(0)
+                    except EOFError:
+                        pass
+                    if source_pixels > max_edge * max_edge * 4:
+                        if image_format == "JPEG":
+                            source.draft("RGB", (max_edge, max_edge))
+                            if source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
+                                raise GalleryError(
+                                    "当前 Pillow 无法安全降采样这张超大 JPEG；请先缩小后重新导入。"
+                                )
+                        elif source_pixels > MAX_IMAGE_DECODE_PIXELS:
+                            raise GalleryError(
+                                "这张非 JPEG 图片的像素数超过安全处理上限；请先缩小后重新导入。"
+                            )
+                    frame = ImageOps.exif_transpose(source.copy())
+                    frame.thumbnail(
+                        (max_edge, max_edge),
+                        Image.Resampling.LANCZOS,
+                    )
+                    if frame.mode in ("RGBA", "LA") or "transparency" in frame.info:
+                        rgba = frame.convert("RGBA")
+                        preview = Image.new("RGB", rgba.size, "white")
+                        preview.paste(rgba, mask=rgba.getchannel("A"))
+                    else:
+                        preview = frame.convert("RGB")
+                    with BytesIO() as output:
+                        preview.save(
+                            output,
+                            format="JPEG",
+                            quality=86,
+                            subsampling=0,
+                            optimize=False,
+                            progressive=False,
+                        )
+                        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                    data_url = f"data:image/jpeg;base64,{encoded}"
+                    preview_width, preview_height = preview.size
+        except GalleryError:
+            raise
+        except Image.DecompressionBombError as exc:
+            raise GalleryError("图片像素超过安全处理上限。") from exc
+        except Exception as exc:
+            raise GalleryError("图片读取或预览生成失败。") from exc
+
+        cache_size = len(data_url)
+        if cache_size <= self._mirage_preview_cache_limit:
+            with self._lock:
+                previous = self._mirage_preview_cache.pop(cache_key, None)
+                if previous is not None:
+                    self._mirage_preview_cache_bytes -= len(previous[0])
+                self._mirage_preview_cache[cache_key] = (
+                    data_url,
+                    preview_width,
+                    preview_height,
+                )
+                self._mirage_preview_cache_bytes += cache_size
+                while (
+                    self._mirage_preview_cache_bytes > self._mirage_preview_cache_limit
+                    and len(self._mirage_preview_cache) > 1
+                ):
+                    _, evicted = self._mirage_preview_cache.popitem(last=False)
+                    self._mirage_preview_cache_bytes -= len(evicted[0])
+
+        return {
+            "id": row["id"],
+            "category_id": row["category_id"],
+            "category_name": row["category_name"],
+            "width": row["width"],
+            "height": row["height"],
+            "preview_width": preview_width,
+            "preview_height": preview_height,
+            "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
+            "data_url": data_url,
+            "max_image_bytes": self.max_image_bytes,
         }
 
     def get_media_for_evaluation(self, image_id: int, scope: str) -> dict:

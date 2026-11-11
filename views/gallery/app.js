@@ -1,9 +1,55 @@
+import { renderMirage } from "./mirage.js";
+
 const bridge = window.AstrBotPluginView;
 const PAGE_SIZE = 30;
 
 const els = {
   notice: document.querySelector("#notice"),
   openTaskCenter: document.querySelector("#openTaskCenterButton"),
+  openMirage: document.querySelector("#openMirageButton"),
+  mirageModal: document.querySelector("#mirageModal"),
+  closeMirage: document.querySelector("#closeMirageButton"),
+  useSelectedMirage: document.querySelector("#useSelectedMirageButton"),
+  swapMirage: document.querySelector("#swapMirageImagesButton"),
+  mirageInnerPickerCategory: document.querySelector("#mirageInnerPickerCategory"),
+  mirageInnerPickerGrid: document.querySelector("#mirageInnerPickerGrid"),
+  mirageInnerPickerPrevious: document.querySelector("#mirageInnerPickerPrevious"),
+  mirageInnerPickerNext: document.querySelector("#mirageInnerPickerNext"),
+  mirageInnerPickerPage: document.querySelector("#mirageInnerPickerPage"),
+  mirageCoverPickerCategory: document.querySelector("#mirageCoverPickerCategory"),
+  mirageCoverPickerGrid: document.querySelector("#mirageCoverPickerGrid"),
+  mirageCoverPickerPrevious: document.querySelector("#mirageCoverPickerPrevious"),
+  mirageCoverPickerNext: document.querySelector("#mirageCoverPickerNext"),
+  mirageCoverPickerPage: document.querySelector("#mirageCoverPickerPage"),
+  mirageSettingsStatus: document.querySelector("#mirageSettingsStatus"),
+  mirageInnerId: document.querySelector("#mirageInnerIdInput"),
+  mirageCoverId: document.querySelector("#mirageCoverIdInput"),
+  loadMirageSources: document.querySelector("#loadMirageSourcesButton"),
+  mirageInnerPreview: document.querySelector("#mirageInnerPreview"),
+  mirageCoverPreview: document.querySelector("#mirageCoverPreview"),
+  mirageInnerMeta: document.querySelector("#mirageInnerMeta"),
+  mirageCoverMeta: document.querySelector("#mirageCoverMeta"),
+  mirageStatus: document.querySelector("#mirageStatus"),
+  mirageMaxSize: document.querySelector("#mirageMaxSizeInput"),
+  mirageInnerScale: document.querySelector("#mirageInnerScaleInput"),
+  mirageCoverScale: document.querySelector("#mirageCoverScaleInput"),
+  mirageInnerDesat: document.querySelector("#mirageInnerDesatInput"),
+  mirageCoverDesat: document.querySelector("#mirageCoverDesatInput"),
+  mirageWeight: document.querySelector("#mirageWeightInput"),
+  mirageColored: document.querySelector("#mirageColoredInput"),
+  mirageMaxSizeValue: document.querySelector("#mirageMaxSizeValue"),
+  mirageInnerScaleValue: document.querySelector("#mirageInnerScaleValue"),
+  mirageCoverScaleValue: document.querySelector("#mirageCoverScaleValue"),
+  mirageInnerDesatValue: document.querySelector("#mirageInnerDesatValue"),
+  mirageCoverDesatValue: document.querySelector("#mirageCoverDesatValue"),
+  mirageWeightValue: document.querySelector("#mirageWeightValue"),
+  mirageWhiteCanvas: document.querySelector("#mirageWhiteCanvas"),
+  mirageBlackCanvas: document.querySelector("#mirageBlackCanvas"),
+  mirageRawCanvas: document.querySelector("#mirageRawCanvas"),
+  mirageOutputMeta: document.querySelector("#mirageOutputMeta"),
+  mirageCategory: document.querySelector("#mirageCategorySelect"),
+  mirageSave: document.querySelector("#saveMirageButton"),
+  mirageSizeHint: document.querySelector("#mirageSizeHint"),
   taskCenterBadge: document.querySelector("#taskCenterBadge"),
   taskCenterModal: document.querySelector("#taskCenterModal"),
   closeTaskCenter: document.querySelector("#closeTaskCenterButton"),
@@ -169,6 +215,22 @@ const state = {
   duplicateSelected: new Set(),
   duplicateJob: null,
   taskCenterOpen: false,
+  taskCenterSeenFailedIds: new Set(),
+  mirageSources: { inner: null, cover: null },
+  mirageOutputReady: false,
+  mirageOutputNsfw: false,
+  mirageMaxImageBytes: 0,
+  mirageRenderTimer: 0,
+  miragePicker: {
+    inner: { categoryId: "", page: 1, pages: 1, items: [], requestId: 0 },
+    cover: { categoryId: "", page: 1, pages: 1, items: [], requestId: 0 },
+  },
+  mirageSelectedIds: { inner: 0, cover: 0 },
+  mirageSourceCache: new Map(),
+  mirageSourceRequestId: 0,
+  mirageSettingsLoaded: false,
+  mirageSettingsSaveTimer: 0,
+  mirageSettingsSaveChain: Promise.resolve(),
   taskPollTimer: 0,
   taskData: null,
   taskStatusSnapshot: new Map(),
@@ -938,11 +1000,35 @@ async function loadTaskCenter() {
   els.reassessSfw.disabled = !stale.sfw || !stale.sfw_model_id;
   els.reassessNsfw.disabled = !stale.nsfw || !state.tagProviders.length;
 
+  const visibleTaskIds = new Set(tasks.map((task) => task.task_id));
+  for (const taskId of state.taskCenterSeenFailedIds) {
+    if (!visibleTaskIds.has(taskId)) state.taskCenterSeenFailedIds.delete(taskId);
+  }
+  const failedTasks = tasks.filter(
+    (task) => task.status === "failed" && !task.has_retry,
+  );
+  const unseenFailedIds = new Set(
+    failedTasks
+      .filter((task) => !state.taskCenterSeenFailedIds.has(task.task_id))
+      .map((task) => task.task_id),
+  );
   const activeCount = tasks.filter((task) => ["queued", "running"].includes(task.status)).length;
-  const failedCount = tasks.filter((task) => task.status === "failed" && !task.has_retry).length;
-  const attentionCount = activeCount + failedCount;
+  const unreadFailedCount = state.taskCenterOpen ? 0 : unseenFailedIds.size;
+  const attentionCount = activeCount + unreadFailedCount;
   els.taskCenterBadge.hidden = attentionCount === 0;
   els.taskCenterBadge.textContent = attentionCount > 99 ? "99+" : String(attentionCount);
+
+  const taskPriority = (task) => {
+    if (["queued", "running"].includes(task.status)) return 0;
+    if (unseenFailedIds.has(task.task_id)) return 1;
+    return 2;
+  };
+  const taskDate = (task) => new Date(task.created_at || "").getTime() || 0;
+  const displayTasks = [...tasks].sort((left, right) =>
+    taskPriority(left) - taskPriority(right)
+      || taskDate(right) - taskDate(left)
+      || String(right.task_id).localeCompare(String(left.task_id))
+  );
   const counts = tasks.reduce((total, task) => {
     total[task.status] = (total[task.status] || 0) + 1;
     return total;
@@ -951,7 +1037,10 @@ async function loadTaskCenter() {
     `最近显示 ${tasks.length} 项 · 排队 ${counts.queued || 0} · 处理中 ${counts.running || 0} · 失败 ${counts.failed || 0} · 成功 ${counts.succeeded || 0}`;
   els.taskList.replaceChildren();
   els.taskEmptyState.hidden = tasks.length > 0;
-  for (const task of tasks) els.taskList.append(makeTaskCard(task));
+  for (const task of displayTasks) els.taskList.append(makeTaskCard(task));
+  if (state.taskCenterOpen) {
+    for (const taskId of unseenFailedIds) state.taskCenterSeenFailedIds.add(taskId);
+  }
   if (videoPreviewCompleted && !els.galleryPanel.hidden && !state.searchActive && !state.trashMode) {
     loadImages().catch(() => {});
   }
@@ -1594,8 +1683,665 @@ function confirmAction(title, message, actionLabel = "确认删除") {
   });
 }
 
+function setMirageStatus(message, isError = false) {
+  els.mirageStatus.textContent = message;
+  els.mirageStatus.classList.toggle("error", isError);
+}
+
+function mirageOptions() {
+  return {
+    maxSize: Number(els.mirageMaxSize.value),
+    scaleInner: Number(els.mirageInnerScale.value),
+    scaleCover: Number(els.mirageCoverScale.value),
+    desatInner: Number(els.mirageInnerDesat.value),
+    desatCover: Number(els.mirageCoverDesat.value),
+    weightInner: Number(els.mirageWeight.value),
+    colored: els.mirageColored.checked,
+  };
+}
+
+function updateMirageControlLabels() {
+  els.mirageMaxSizeValue.textContent = Number(els.mirageMaxSize.value) + " px";
+  els.mirageInnerScaleValue.textContent = Number(els.mirageInnerScale.value).toFixed(2);
+  els.mirageCoverScaleValue.textContent = Number(els.mirageCoverScale.value).toFixed(2);
+  els.mirageInnerDesatValue.textContent = Number(els.mirageInnerDesat.value).toFixed(2);
+  els.mirageCoverDesatValue.textContent = Number(els.mirageCoverDesat.value).toFixed(2);
+  els.mirageWeightValue.textContent = Number(els.mirageWeight.value).toFixed(2);
+}
+
+function renderMirageCategories() {
+  const previousId = els.mirageCategory.value;
+  const sourcesAreNsfw = Boolean(
+    state.mirageSources.inner?.is_nsfw || state.mirageSources.cover?.is_nsfw,
+  );
+  const categories = state.categories.filter((category) => !sourcesAreNsfw || category.is_nsfw);
+  els.mirageCategory.replaceChildren();
+  for (const category of categories) {
+    const option = document.createElement("option");
+    option.value = category.id;
+    option.textContent = category.name + (category.is_nsfw ? " · NSFW" : "");
+    els.mirageCategory.append(option);
+  }
+
+  const preferred = categories.find((category) => category.id === previousId)
+    || categories.find((category) => category.id === state.categoryId)
+    || categories.find((category) => category.id === "pending")
+    || categories[0];
+  els.mirageCategory.value = preferred?.id || "";
+  els.mirageCategory.disabled = categories.length === 0;
+  if (sourcesAreNsfw && categories.length === 0) {
+    setMirageStatus("来源含 NSFW 媒体，但当前没有可保存的 NSFW 分类。请先创建或恢复一个 NSFW 分类。", true);
+  }
+  els.mirageSave.disabled = !state.mirageOutputReady || !preferred;
+}
+
+function clearMirageOutput() {
+  state.mirageOutputReady = false;
+  state.mirageOutputNsfw = false;
+  for (const canvas of [els.mirageWhiteCanvas, els.mirageBlackCanvas, els.mirageRawCanvas]) {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+  els.mirageOutputMeta.textContent = "载入图片后生成预览";
+  els.mirageSave.disabled = true;
+}
+
+function renderMirageOutput() {
+  const inner = state.mirageSources.inner;
+  const cover = state.mirageSources.cover;
+  if (!inner || !cover) {
+    clearMirageOutput();
+    return;
+  }
+
+  try {
+    const imageData = renderMirage(inner.image, cover.image, mirageOptions());
+    els.mirageRawCanvas.width = imageData.width;
+    els.mirageRawCanvas.height = imageData.height;
+    const rawContext = els.mirageRawCanvas.getContext("2d");
+    if (!rawContext) throw new Error("浏览器无法创建结果画布。");
+    rawContext.putImageData(imageData, 0, 0);
+
+    for (const [canvas, color] of [
+      [els.mirageWhiteCanvas, "#ffffff"],
+      [els.mirageBlackCanvas, "#11131a"],
+    ]) {
+      canvas.width = imageData.width;
+      canvas.height = imageData.height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("浏览器无法创建预览画布。");
+      context.fillStyle = color;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(els.mirageRawCanvas, 0, 0);
+    }
+
+    state.mirageOutputReady = true;
+    state.mirageOutputNsfw = Boolean(inner.is_nsfw || cover.is_nsfw);
+    els.mirageOutputMeta.textContent = imageData.width + " × " + imageData.height
+      + " · 透明 PNG · " + (state.mirageOutputNsfw ? "NSFW 来源" : "SFW 来源");
+    renderMirageCategories();
+    if (state.mirageOutputNsfw && els.mirageCategory.disabled) {
+      setMirageStatus("来源含 NSFW 标记，但当前没有可保存的 NSFW 分类。请先创建或恢复 NSFW 分类。", true);
+    } else if (state.mirageOutputNsfw) {
+      setMirageStatus("来源含 NSFW 标记，成品分类已限制为 NSFW。");
+    } else {
+      setMirageStatus("预览已更新。保存前请分别检查白底和黑底效果。");
+    }
+  } catch (error) {
+    clearMirageOutput();
+    setMirageStatus(error.message || "生成预览失败。", true);
+  }
+}
+
+function setMirageSettingsStatus(message, isError = false) {
+  els.mirageSettingsStatus.textContent = message;
+  els.mirageSettingsStatus.classList.toggle("error", isError);
+}
+
+async function loadMirageSettings() {
+  if (state.mirageSettingsLoaded) return;
+  const settings = await bridge.apiGet("mirage/settings");
+  els.mirageMaxSize.value = String(settings.maxSize);
+  els.mirageInnerScale.value = String(settings.scaleInner);
+  els.mirageCoverScale.value = String(settings.scaleCover);
+  els.mirageInnerDesat.value = String(settings.desatInner);
+  els.mirageCoverDesat.value = String(settings.desatCover);
+  els.mirageWeight.value = String(settings.weightInner);
+  els.mirageColored.checked = settings.colored !== false;
+  state.mirageSettingsLoaded = true;
+  updateMirageControlLabels();
+  setMirageSettingsStatus("已载入上次使用的参数；修改后会自动保存。");
+}
+
+async function saveMirageSettingsNow() {
+  if (!state.mirageSettingsLoaded) return false;
+  window.clearTimeout(state.mirageSettingsSaveTimer);
+  state.mirageSettingsSaveTimer = 0;
+  setMirageSettingsStatus("正在保存参数…");
+  const settings = mirageOptions();
+  const pendingSave = state.mirageSettingsSaveChain
+    .catch(() => undefined)
+    .then(() => bridge.apiPost("mirage/settings/save", settings));
+  state.mirageSettingsSaveChain = pendingSave;
+  try {
+    await pendingSave;
+    setMirageSettingsStatus("参数已保存，下次打开会继续使用。");
+    return true;
+  } catch (error) {
+    setMirageSettingsStatus("参数保存失败：" + (error.message || "请稍后重试。"), true);
+    return false;
+  }
+}
+
+function scheduleSaveMirageSettings() {
+  if (!state.mirageSettingsLoaded) return;
+  window.clearTimeout(state.mirageSettingsSaveTimer);
+  setMirageSettingsStatus("参数变更待保存…");
+  state.mirageSettingsSaveTimer = window.setTimeout(() => {
+    saveMirageSettingsNow();
+  }, 450);
+}
+
+function scheduleMirageRender() {
+  updateMirageControlLabels();
+  window.clearTimeout(state.mirageRenderTimer);
+  state.mirageRenderTimer = window.setTimeout(renderMirageOutput, 90);
+  scheduleSaveMirageSettings();
+}
+
+function handleMirageColorChange() {
+  renderMirageOutput();
+  scheduleSaveMirageSettings();
+}
+
+function miragePickerElements(which) {
+  if (which === "inner") {
+    return {
+      category: els.mirageInnerPickerCategory,
+      grid: els.mirageInnerPickerGrid,
+      previous: els.mirageInnerPickerPrevious,
+      next: els.mirageInnerPickerNext,
+      pageLabel: els.mirageInnerPickerPage,
+      idInput: els.mirageInnerId,
+      title: "里图",
+    };
+  }
+  return {
+    category: els.mirageCoverPickerCategory,
+    grid: els.mirageCoverPickerGrid,
+    previous: els.mirageCoverPickerPrevious,
+    next: els.mirageCoverPickerNext,
+    pageLabel: els.mirageCoverPickerPage,
+    idInput: els.mirageCoverId,
+    title: "表图",
+  };
+}
+
+function populateMiragePickerCategories() {
+  for (const which of ["inner", "cover"]) {
+    const picker = state.miragePicker[which];
+    const elements = miragePickerElements(which);
+    const previousId = elements.category.value || picker.categoryId;
+    elements.category.replaceChildren();
+    for (const category of state.categories) {
+      const option = document.createElement("option");
+      option.value = category.id;
+      option.textContent = category.name + (category.is_nsfw ? " · NSFW" : "");
+      elements.category.append(option);
+    }
+    const preferred = state.categories.find((category) => category.id === previousId)
+      || state.categories.find((category) => category.id === state.categoryId)
+      || state.categories[0];
+    picker.categoryId = preferred?.id || "";
+    elements.category.value = picker.categoryId;
+    elements.category.disabled = state.categories.length === 0;
+  }
+}
+
+function showMiragePickerMessage(which, message) {
+  const elements = miragePickerElements(which);
+  const messageNode = document.createElement("p");
+  messageNode.className = "hint mirage-picker-message";
+  messageNode.textContent = message;
+  elements.grid.replaceChildren(messageNode);
+}
+
+function renderMiragePicker(which) {
+  const picker = state.miragePicker[which];
+  const elements = miragePickerElements(which);
+  const images = picker.items.filter((item) => item.media_type === "image");
+  elements.grid.replaceChildren();
+
+  if (!images.length) {
+    showMiragePickerMessage(which, "此页没有图片；视频不会显示在选择器中。");
+  } else {
+    for (const item of images) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "mirage-picker-item";
+      const selected = Number(state.mirageSelectedIds[which]) === Number(item.id);
+      button.classList.toggle("selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
+      button.setAttribute("aria-label", "选择" + elements.title + "，编号 " + item.id);
+      button.title = "选择编号 " + item.id + " 作为" + elements.title;
+
+      if (item.thumbnail) {
+        const image = document.createElement("img");
+        image.src = item.thumbnail;
+        image.alt = "";
+        image.loading = "lazy";
+        button.append(image);
+      } else {
+        const placeholder = document.createElement("span");
+        placeholder.className = "mirage-picker-no-thumbnail";
+        placeholder.textContent = "暂无缩略图";
+        button.append(placeholder);
+      }
+
+      const caption = document.createElement("span");
+      caption.className = "mirage-picker-caption";
+      caption.textContent = "编号 " + item.id;
+      button.append(caption);
+      button.addEventListener("click", () => chooseMiragePickerImage(which, item));
+      elements.grid.append(button);
+    }
+  }
+
+  elements.pageLabel.textContent = "第 " + picker.page + " / " + picker.pages
+    + " 页 · " + images.length + " 张图片";
+  elements.previous.disabled = picker.page <= 1;
+  elements.next.disabled = picker.page >= picker.pages;
+}
+
+async function loadMiragePicker(which, page = 1) {
+  const picker = state.miragePicker[which];
+  const elements = miragePickerElements(which);
+  const categoryId = elements.category.value;
+  if (!categoryId) {
+    picker.categoryId = "";
+    picker.page = 1;
+    picker.pages = 1;
+    picker.items = [];
+    renderMiragePicker(which);
+    return;
+  }
+
+  picker.categoryId = categoryId;
+  const requestId = (picker.requestId || 0) + 1;
+  picker.requestId = requestId;
+  showMiragePickerMessage(which, "正在读取分类缩略图…");
+  try {
+    const data = await bridge.apiGet("images", {
+      category_id: categoryId,
+      page,
+      page_size: PAGE_SIZE,
+      media_type: "image",
+    });
+    if (requestId !== picker.requestId) return;
+    picker.page = data.page;
+    picker.pages = data.pages;
+    picker.items = Array.isArray(data.items) ? data.items : [];
+    renderMiragePicker(which);
+  } catch (error) {
+    if (requestId !== picker.requestId) return;
+    picker.items = [];
+    picker.page = Math.max(1, Number(page) || 1);
+    picker.pages = 1;
+    renderMiragePicker(which);
+    showMiragePickerMessage(which, error.message || "读取分类缩略图失败。");
+  }
+}
+
+function renderMirageSourceCards() {
+  for (const [which, source, preview, meta, title] of [
+    ["inner", state.mirageSources.inner, els.mirageInnerPreview, els.mirageInnerMeta, "里图"],
+    ["cover", state.mirageSources.cover, els.mirageCoverPreview, els.mirageCoverMeta, "表图"],
+  ]) {
+    if (!source) {
+      preview.hidden = true;
+      meta.textContent = "尚未载入图片";
+      continue;
+    }
+    preview.src = source.data_url;
+    preview.hidden = false;
+    preview.alt = title + "预览，图库编号 " + source.id;
+    meta.textContent = "编号 " + source.id + " · " + source.category_name
+      + (source.is_nsfw ? " · NSFW" : "")
+      + " · " + source.width + " × " + source.height;
+  }
+}
+
+async function chooseMiragePickerImage(which, item) {
+  const elements = miragePickerElements(which);
+  state.mirageSelectedIds[which] = Number(item.id);
+  elements.idInput.value = String(item.id);
+  renderMiragePicker(which);
+  const other = which === "inner" ? "cover" : "inner";
+  if (Number(state.mirageSelectedIds[other]) > 0) {
+    await loadMirageSources();
+  } else {
+    setMirageStatus("已选" + elements.title + "编号 " + item.id + "，请再选择另一张图。");
+  }
+}
+
+function handleMirageIdInput(which) {
+  const elements = miragePickerElements(which);
+  const value = Number(elements.idInput.value);
+  state.mirageSelectedIds[which] = Number.isInteger(value) && value > 0 ? value : 0;
+  renderMiragePicker(which);
+
+  const currentInnerId = String(els.mirageInnerId.value || "");
+  const currentCoverId = String(els.mirageCoverId.value || "");
+  const loadedSourcesMatch = state.mirageSources.inner
+    && state.mirageSources.cover
+    && String(state.mirageSources.inner.id) === currentInnerId
+    && String(state.mirageSources.cover.id) === currentCoverId;
+  if (!loadedSourcesMatch && (state.mirageSources.inner || state.mirageSources.cover)) {
+    state.mirageSources = { inner: null, cover: null };
+    state.mirageMaxImageBytes = 0;
+    els.mirageInnerPreview.hidden = true;
+    els.mirageCoverPreview.hidden = true;
+    els.mirageInnerMeta.textContent = "编号已修改，请重新载入";
+    els.mirageCoverMeta.textContent = "编号已修改，请重新载入";
+    clearMirageOutput();
+    renderMirageCategories();
+    setMirageStatus("来源编号已修改，请载入两张图片后再保存。");
+  }
+}
+
+async function loadMirageImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("图片预览解码失败。"));
+    image.src = dataUrl;
+  });
+}
+
+async function loadMirageSources() {
+  const requestId = ++state.mirageSourceRequestId;
+  state.mirageSources = { inner: null, cover: null };
+  state.mirageMaxImageBytes = 0;
+  els.mirageInnerPreview.hidden = true;
+  els.mirageCoverPreview.hidden = true;
+  els.mirageInnerMeta.textContent = "正在载入图片…";
+  els.mirageCoverMeta.textContent = "正在载入图片…";
+  clearMirageOutput();
+  const innerId = Number(els.mirageInnerId.value);
+  const coverId = Number(els.mirageCoverId.value);
+  if (!Number.isInteger(innerId) || innerId < 1
+    || !Number.isInteger(coverId) || coverId < 1) {
+    els.mirageInnerMeta.textContent = "尚未载入图片";
+    els.mirageCoverMeta.textContent = "尚未载入图片";
+    renderMirageCategories();
+    els.loadMirageSources.disabled = false;
+    setMirageStatus("请输入两个有效的图库图片编号。", true);
+    return;
+  }
+  if (innerId === coverId) {
+    els.mirageInnerMeta.textContent = "尚未载入图片";
+    els.mirageCoverMeta.textContent = "尚未载入图片";
+    renderMirageCategories();
+    els.loadMirageSources.disabled = false;
+    setMirageStatus("里图和表图需要选择两张不同的图片。", true);
+    return;
+  }
+
+  state.mirageSelectedIds = { inner: innerId, cover: coverId };
+  renderMiragePicker("inner");
+  renderMiragePicker("cover");
+  els.loadMirageSources.disabled = true;
+  els.mirageSave.disabled = true;
+  setMirageStatus("正在读取图库图片并生成预览…");
+  try {
+    const readSource = async (imageId) => {
+      const cacheKey = Number(imageId);
+      const cached = state.mirageSourceCache.get(cacheKey);
+      if (cached) {
+        state.mirageSourceCache.delete(cacheKey);
+        state.mirageSourceCache.set(cacheKey, cached);
+        return cached;
+      }
+      const source = await bridge.apiPost("mirage/source", { image_id: imageId });
+      const image = await loadMirageImage(source.data_url);
+      const loaded = { ...source, image };
+      state.mirageSourceCache.set(cacheKey, loaded);
+      while (state.mirageSourceCache.size > 8) {
+        const oldestKey = state.mirageSourceCache.keys().next().value;
+        state.mirageSourceCache.delete(oldestKey);
+      }
+      return loaded;
+    };
+    const [inner, cover] = await Promise.all([
+      readSource(innerId),
+      readSource(coverId),
+    ]);
+    if (requestId !== state.mirageSourceRequestId) return;
+    state.mirageSources = { inner, cover };
+    state.mirageMaxImageBytes = Math.min(
+      Number(inner.max_image_bytes || 0),
+      Number(cover.max_image_bytes || 0),
+    );
+    renderMirageSourceCards();
+    const maxMb = (state.mirageMaxImageBytes / (1024 * 1024)).toFixed(1);
+    els.mirageSizeHint.textContent = "当前图片入库上限为 " + maxMb
+      + " MB。超出时请降低输出最长边后重新预览；为保留透明像素，不会对成品再做有损压缩。";
+    renderMirageOutput();
+  } catch (error) {
+    if (requestId !== state.mirageSourceRequestId) return;
+    els.mirageInnerMeta.textContent = "尚未载入图片";
+    els.mirageCoverMeta.textContent = "尚未载入图片";
+    renderMirageCategories();
+    setMirageStatus(error.message || "读取图库图片失败。", true);
+    clearMirageOutput();
+  } finally {
+    if (requestId === state.mirageSourceRequestId) {
+      els.loadMirageSources.disabled = false;
+    }
+  }
+}
+
+async function openMirageModal() {
+  els.mirageModal.hidden = false;
+  updateMirageControlLabels();
+  renderMirageCategories();
+  setMirageSettingsStatus("正在载入上次使用的参数…");
+  try {
+    await loadMirageSettings();
+  } catch (error) {
+    setMirageSettingsStatus("读取保存参数失败，暂时使用页面默认值：" + (error.message || ""), true);
+  }
+
+  populateMiragePickerCategories();
+  const pickerLoads = [
+    loadMiragePicker("inner", 1),
+    loadMiragePicker("cover", 1),
+  ];
+  const selectedIds = Array.from(state.selected);
+  if (selectedIds.length === 2) {
+    els.mirageCoverId.value = selectedIds[0];
+    els.mirageInnerId.value = selectedIds[1];
+    state.mirageSelectedIds = { cover: Number(selectedIds[0]), inner: Number(selectedIds[1]) };
+    loadMirageSources();
+  } else if (!els.mirageInnerId.value || !els.mirageCoverId.value) {
+    setMirageStatus("从两侧分类缩略图选择，或输入编号；也可先在图集中勾选两张图片。");
+  }
+  await Promise.allSettled(pickerLoads);
+}
+
+function closeMirageModal() {
+  els.mirageModal.hidden = true;
+}
+
+async function useSelectedMirageImages() {
+  const selectedIds = Array.from(state.selected);
+  if (selectedIds.length !== 2) {
+    setMirageStatus("请先在图集中恰好勾选两张图片，再使用此按钮。", true);
+    return;
+  }
+  els.mirageCoverId.value = selectedIds[0];
+  els.mirageInnerId.value = selectedIds[1];
+  state.mirageSelectedIds = { cover: Number(selectedIds[0]), inner: Number(selectedIds[1]) };
+  await loadMirageSources();
+}
+
+async function swapMirageImages() {
+  const previousInnerId = String(els.mirageInnerId.value || "");
+  const previousCoverId = String(els.mirageCoverId.value || "");
+  if (!previousInnerId || !previousCoverId) {
+    setMirageStatus("先载入或选择里图和表图，再进行互换。", true);
+    return;
+  }
+
+  const canSwapLoadedSources = state.mirageSources.inner
+    && state.mirageSources.cover
+    && String(state.mirageSources.inner.id) === previousInnerId
+    && String(state.mirageSources.cover.id) === previousCoverId;
+  els.mirageInnerId.value = previousCoverId;
+  els.mirageCoverId.value = previousInnerId;
+  state.mirageSelectedIds = {
+    inner: Number(previousCoverId),
+    cover: Number(previousInnerId),
+  };
+  renderMiragePicker("cover");
+  renderMiragePicker("inner");
+
+  if (!canSwapLoadedSources) {
+    await loadMirageSources();
+    return;
+  }
+
+  state.mirageSources = {
+    inner: state.mirageSources.cover,
+    cover: state.mirageSources.inner,
+  };
+  renderMirageSourceCards();
+  renderMirageOutput();
+  setMirageStatus("里图和表图已互换，预览已更新。");
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("浏览器无法导出透明 PNG。"));
+    }, "image/png");
+  });
+}
+
+async function saveMirageToGallery() {
+  const category = state.categories.find((item) => item.id === els.mirageCategory.value);
+  if (!state.mirageOutputReady || !category) {
+    setMirageStatus("请先载入两张图片，并选择有效的保存分类。", true);
+    return;
+  }
+  if (state.mirageOutputNsfw && !category.is_nsfw) {
+    setMirageStatus("NSFW 来源的成品只能保存到 NSFW 分类。", true);
+    renderMirageCategories();
+    return;
+  }
+
+  els.mirageSave.disabled = true;
+  setMirageStatus("正在导出透明 PNG…");
+  try {
+    await saveMirageSettingsNow();
+    const blob = await canvasToBlob(els.mirageRawCanvas);
+    if (state.mirageMaxImageBytes > 0 && blob.size > state.mirageMaxImageBytes) {
+      const limit = formatBytes(state.mirageMaxImageBytes);
+      throw new Error("生成 PNG 为 " + formatBytes(blob.size) + "，超过当前入库上限 "
+        + limit + "。请降低输出最长边后重新预览。");
+    }
+    const innerId = state.mirageSources.inner.id;
+    const coverId = state.mirageSources.cover.id;
+    const file = new File(
+      [blob],
+      "mirage-" + innerId + "-" + coverId + ".png",
+      { type: "image/png" },
+    );
+    setMirageStatus("正在将 PNG 保存到「" + category.name + "」…");
+    const result = await uploadOneMedia(file, category.id, 1, 1);
+    closeMirageModal();
+    state.trashMode = false;
+    state.duplicateMode = false;
+    state.searchActive = false;
+    state.searchQuery = "";
+    state.tagFilter = "";
+    state.page = 1;
+    els.galleryPanel.hidden = false;
+    els.duplicatePanel.hidden = true;
+    els.tagTaxonomyPanel.hidden = true;
+    els.activeToolbar.hidden = false;
+    els.activeSearchPanel.hidden = false;
+    els.activeSelectionActions.hidden = false;
+    els.trashActions.hidden = true;
+    try {
+      await loadCategories(category.id);
+    } catch (error) {
+      showNotice("成品已上传，但刷新图库失败：" + (error.message || "请手动刷新。"), "error", 0);
+      return;
+    }
+    showNotice(
+      result.duplicate
+        ? "该幻影坦克图片已存在于「" + category.name + "」，跳过重复项。"
+        : "幻影坦克 PNG 已保存到「" + category.name + "」。",
+      "success",
+    );
+  } catch (error) {
+    setMirageStatus(error.message || "保存幻影坦克失败。", true);
+  } finally {
+    if (!els.mirageModal.hidden) {
+      els.mirageSave.disabled = !state.mirageOutputReady;
+    }
+  }
+}
+
 document.querySelector("#refreshButton").addEventListener("click", refresh);
 els.openTaskCenter.addEventListener("click", openTaskCenter);
+els.openMirage.addEventListener("click", openMirageModal);
+els.closeMirage.addEventListener("click", closeMirageModal);
+els.useSelectedMirage.addEventListener("click", useSelectedMirageImages);
+els.loadMirageSources.addEventListener("click", loadMirageSources);
+els.swapMirage.addEventListener("click", swapMirageImages);
+els.mirageInnerPickerCategory.addEventListener("change", () => loadMiragePicker("inner", 1));
+els.mirageCoverPickerCategory.addEventListener("change", () => loadMiragePicker("cover", 1));
+els.mirageInnerPickerPrevious.addEventListener("click", () => {
+  loadMiragePicker("inner", state.miragePicker.inner.page - 1);
+});
+els.mirageInnerPickerNext.addEventListener("click", () => {
+  loadMiragePicker("inner", state.miragePicker.inner.page + 1);
+});
+els.mirageCoverPickerPrevious.addEventListener("click", () => {
+  loadMiragePicker("cover", state.miragePicker.cover.page - 1);
+});
+els.mirageCoverPickerNext.addEventListener("click", () => {
+  loadMiragePicker("cover", state.miragePicker.cover.page + 1);
+});
+els.mirageInnerId.addEventListener("input", () => handleMirageIdInput("inner"));
+els.mirageCoverId.addEventListener("input", () => handleMirageIdInput("cover"));
+els.mirageInnerId.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") loadMirageSources();
+});
+els.mirageCoverId.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") loadMirageSources();
+});
+els.mirageModal.addEventListener("click", (event) => {
+  if (event.target === els.mirageModal) closeMirageModal();
+});
+els.mirageSave.addEventListener("click", saveMirageToGallery);
+for (const input of [
+  els.mirageMaxSize,
+  els.mirageInnerScale,
+  els.mirageCoverScale,
+  els.mirageInnerDesat,
+  els.mirageCoverDesat,
+  els.mirageWeight,
+]) {
+  input.addEventListener("input", scheduleMirageRender);
+}
+els.mirageColored.addEventListener("change", handleMirageColorChange);
+els.mirageCategory.addEventListener("change", () => {
+  els.mirageSave.disabled = !state.mirageOutputReady || !els.mirageCategory.value;
+});
 els.closeTaskCenter.addEventListener("click", closeTaskCenter);
 els.refreshTasks.addEventListener("click", () => {
   loadTaskCenter().catch((error) => showNotice(error.message || "刷新任务失败。", "error", 0));
@@ -1610,6 +2356,7 @@ els.taskNsfwProvider.addEventListener("change", () => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.taskCenterOpen) closeTaskCenter();
+  if (event.key === "Escape" && !els.mirageModal.hidden) closeMirageModal();
 });
 els.categorySelect.addEventListener("change", async () => {
   state.categoryId = els.categorySelect.value;

@@ -33,6 +33,7 @@ PLUGIN_NAME = "astrbot_plugin_image_library"
 WEB_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 WEB_UPLOAD_SESSION_TTL_SECONDS = 3600
 WEB_UPLOAD_JOB_TTL_SECONDS = 3600
+MIRAGE_REFERENCE_TTL_SECONDS = 600
 
 
 @filter.command_group("图集", alias={"图库"})
@@ -94,6 +95,8 @@ class ImageLibraryPlugin(Star):
         self._embedding_semaphore = asyncio.Semaphore(1)
         self._video_preview_semaphore = asyncio.Semaphore(1)
         self._trash_cleanup_task: asyncio.Task | None = None
+        self._mirage_pending_cleanup_task: asyncio.Task | None = None
+        self._mirage_pending_covers: dict[str, dict] = {}
         self._embedding_job: dict | None = None
         self._embedding_job_task: asyncio.Task | None = None
         self._duplicate_job: dict | None = None
@@ -114,6 +117,9 @@ class ImageLibraryPlugin(Star):
             (f"/{PLUGIN_NAME}/upload/cancel", self.web_upload_cancel, ["POST"], "Cancel a chunked media upload"),
             (f"/{PLUGIN_NAME}/upload/status", self.web_upload_status, ["GET"], "Read media import status"),
             (f"/{PLUGIN_NAME}/images", self.web_images, ["GET"], "List media in a category"),
+            (f"/{PLUGIN_NAME}/mirage/source", self.web_mirage_source, ["POST"], "Load a library image for phantom-tank creation"),
+            (f"/{PLUGIN_NAME}/mirage/settings", self.web_mirage_settings, ["GET"], "Read phantom-tank settings"),
+            (f"/{PLUGIN_NAME}/mirage/settings/save", self.web_save_mirage_settings, ["POST"], "Save phantom-tank settings"),
             (f"/{PLUGIN_NAME}/images/delete", self.web_delete_images, ["POST"], "Move selected media to trash"),
             (f"/{PLUGIN_NAME}/trash", self.web_trash, ["GET"], "List trashed media"),
             (f"/{PLUGIN_NAME}/trash/restore", self.web_restore_trash, ["POST"], "Restore trashed media"),
@@ -452,8 +458,13 @@ class ImageLibraryPlugin(Star):
             raise
 
     async def initialize(self):
+        self._cleanup_expired_mirage_covers(remove_all=True)
         self._trash_cleanup_task = asyncio.create_task(
             self._trash_cleanup_loop(), name=f"{PLUGIN_NAME}-trash-cleanup"
+        )
+        self._mirage_pending_cleanup_task = asyncio.create_task(
+            self._mirage_pending_cleanup_loop(),
+            name=f"{PLUGIN_NAME}-mirage-reference-cleanup",
         )
 
     async def _trash_cleanup_loop(self):
@@ -475,6 +486,137 @@ class ImageLibraryPlugin(Star):
                     logger.exception(f"回收站每日清理失败，将在 60 秒后重试：{exc}")
                     await asyncio.sleep(60)
 
+    async def _mirage_pending_cleanup_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            self._cleanup_expired_mirage_covers()
+
+    def _cleanup_expired_mirage_covers(self, *, remove_all: bool = False):
+        now = time_module.time()
+        for key, pending in list(self._mirage_pending_covers.items()):
+            if remove_all or now - float(pending.get("created_at", 0)) > MIRAGE_REFERENCE_TTL_SECONDS:
+                self._clear_mirage_pending_cover(key)
+        if remove_all:
+            for path in self.store.staging_dir.glob("mirage-pending-cover-*.source"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _clear_mirage_pending_cover(self, key: str):
+        pending = self._mirage_pending_covers.pop(key, None)
+        if not pending:
+            return
+        try:
+            Path(pending["path"]).unlink(missing_ok=True)
+        except (KeyError, OSError, TypeError):
+            pass
+
+    def _mirage_pending_key(self, event: AstrMessageEvent) -> str:
+        return "|".join(
+            (
+                str(event.get_platform_name() or ""),
+                str(event.get_session_id() or ""),
+                str(event.get_sender_id() or ""),
+            )
+        )
+
+    async def _quoted_mirage_images(self, event: AstrMessageEvent) -> list[Image]:
+        media_items: list[Image] = []
+
+        def collect(components):
+            for component in components or []:
+                if isinstance(component, Image):
+                    media_items.append(component)
+                elif isinstance(component, Reply):
+                    collect(component.chain or [])
+
+        collect(event.get_messages())
+        if not media_items and event.get_platform_name() == "weixin_oc":
+            message_obj = getattr(event, "message_obj", None)
+            ref_msg = getattr(message_obj, "ref_msg", None)
+            platform = getattr(event, "platform", None)
+            reply_resolver = getattr(platform, "_build_reply_component_from_ref", None)
+            if isinstance(ref_msg, dict) and callable(reply_resolver):
+                try:
+                    recovered_reply, _ = await reply_resolver(
+                        session_id=event.get_session_id(),
+                        ref_msg=ref_msg,
+                    )
+                    if recovered_reply is not None:
+                        collect([recovered_reply])
+                except Exception as exc:
+                    logger.warning(f"微信幻影坦克引用图片解析失败：{exc}")
+        return media_items
+
+    async def _resolve_mirage_chat_image(self, image: Image) -> Path:
+        try:
+            image_path = Path(await image.convert_to_file_path())
+            file_size = image_path.stat().st_size
+        except Exception as exc:
+            raise GalleryError("引用图片无法下载或读取。") from exc
+        if not image_path.is_file():
+            raise GalleryError("引用图片文件不存在。")
+        if file_size > self.store.max_source_image_bytes:
+            limit_mb = self.store.max_source_image_bytes // (1024 * 1024)
+            raise GalleryError(f"引用图片超过接收上限 {limit_mb} MB。")
+        return image_path
+
+    async def _remember_mirage_cover(self, key: str, source_path: Path):
+        self._cleanup_expired_mirage_covers()
+        destination = self.store.staging_dir / (
+            f"mirage-pending-cover-{uuid.uuid4().hex}.source"
+        )
+        try:
+            await asyncio.to_thread(shutil.copyfile, source_path, destination)
+        except OSError as exc:
+            destination.unlink(missing_ok=True)
+            raise GalleryError("无法暂存表图，请检查插件临时目录空间。") from exc
+
+        if key not in self._mirage_pending_covers and len(self._mirage_pending_covers) >= 100:
+            oldest_key = min(
+                self._mirage_pending_covers,
+                key=lambda item: self._mirage_pending_covers[item].get("created_at", 0),
+            )
+            self._clear_mirage_pending_cover(oldest_key)
+        self._clear_mirage_pending_cover(key)
+        self._mirage_pending_covers[key] = {
+            "path": str(destination),
+            "created_at": time_module.time(),
+        }
+
+    async def _generate_and_store_mirage(
+        self,
+        cover_path: Path,
+        inner_path: Path,
+        display_name: str,
+    ) -> dict:
+        target = await asyncio.to_thread(
+            self.store.ensure_nsfw_category, "幻影坦克"
+        )
+        settings = await asyncio.to_thread(self.store.get_mirage_settings)
+        output_path = self.store.staging_dir / f"{uuid.uuid4().hex}.png"
+        try:
+            await asyncio.to_thread(
+                self.store.create_mirage_png_from_paths,
+                cover_path,
+                inner_path,
+                output_path,
+                settings,
+            )
+            return await self._ingest_media_with_tasks(
+                output_path,
+                target["id"],
+                "image",
+                "chat",
+                display_name=display_name,
+            )
+        finally:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     async def terminate(self):
         self._web_upload_stopping = True
         try:
@@ -489,6 +631,8 @@ class ImageLibraryPlugin(Star):
         tasks = set(self._processing_tasks.values())
         if self._trash_cleanup_task:
             tasks.add(self._trash_cleanup_task)
+        if self._mirage_pending_cleanup_task:
+            tasks.add(self._mirage_pending_cleanup_task)
         if self._embedding_job_task:
             tasks.add(self._embedding_job_task)
         if self._duplicate_job_task:
@@ -497,6 +641,7 @@ class ImageLibraryPlugin(Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._cleanup_expired_mirage_covers(remove_all=True)
 
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
@@ -507,13 +652,16 @@ class ImageLibraryPlugin(Star):
             "图片收藏指令：\n"
             "/收藏 [分类]（省略分类时放入待处理；附上图片/视频或回复含媒体的消息；仅 AstrBot 管理员）\n"
             "分类不存在时会自动创建。\n"
+            "/幻影 <表图编号> <里图编号>（管理员；成品保存到 NSFW「幻影坦克」分类）\n"
+            "也可分两次引用图片：先引用表图发送 /幻影，再引用里图发送 /幻影。\n"
             "/看 <分类> [媒体编号]（不填编号时随机查看）\n"
             "/搜图 <标签关键词>（模糊匹配标签/别名；搜父标签时包含子标签，并随机返回图片或视频）\n"
             "/语义搜索 <画面描述>（按语义匹配并随机返回一张图片）\n"
             "/分类（查看可用分类）\n"
             "/图集 删除 <媒体编号>（移入回收站，仅管理员）\n"
             "/图集 帮助\n"
-            "支持 JPG、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM。\n"
+            "支持 JPG、MPO、PNG、GIF、WebP、BMP、MP4、MOV、3GP、AVI、MKV、WebM。\n"
+            "MPO 会提取主画面并转换为普通 JPEG。\n"
             "WebUI 可批量导入、移动、回收站管理和管理媒体分类：插件 → QQ/个人微信图片与视频图集。"
         )
 
@@ -659,6 +807,110 @@ class ImageLibraryPlugin(Star):
         if errors:
             message += f"\n失败 {len(errors)} 个：" + "；".join(dict.fromkeys(errors[:3]))
         yield event.plain_result(message)
+
+    @filter.platform_adapter_type(
+        filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
+    )
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("幻影")
+    async def command_make_mirage(
+        self,
+        event: AstrMessageEvent,
+        cover_id: int | None = None,
+        inner_id: int | None = None,
+    ):
+        if not self._may_view_nsfw(event):
+            yield event.plain_result("该指令会将成品保存到 NSFW 分类，仅允许具有 NSFW 权限的管理员使用。")
+            return
+
+        pending_key = self._mirage_pending_key(event)
+        self._cleanup_expired_mirage_covers()
+        has_ids = cover_id is not None or inner_id is not None
+        if has_ids:
+            if cover_id is None or inner_id is None:
+                yield event.plain_result("指令格式：/幻影 <表图编号> <里图编号>。")
+                return
+            try:
+                sources = await asyncio.to_thread(
+                    self.store.get_mirage_chat_sources,
+                    cover_id,
+                    inner_id,
+                    allow_nsfw=True,
+                )
+                result = await self._generate_and_store_mirage(
+                    sources["cover"]["path"],
+                    sources["inner"]["path"],
+                    f"幻影坦克_表图{cover_id}_里图{inner_id}.png",
+                )
+            except GalleryError as exc:
+                yield event.plain_result(f"幻影坦克生成失败：{exc}")
+                return
+            except Exception as exc:
+                logger.warning(f"聊天幻影坦克生成失败：{exc}")
+                yield event.plain_result("幻影坦克生成失败，请检查插件日志。")
+                return
+            self._clear_mirage_pending_cover(pending_key)
+        else:
+            media_items = await self._quoted_mirage_images(event)
+            if len(media_items) > 1:
+                yield event.plain_result("请每次只引用一张图片；第一张作为表图，第二张作为里图。")
+                return
+            if not media_items:
+                if pending_key in self._mirage_pending_covers:
+                    yield event.plain_result("请指定里图。请引用里图图片并再次发送 /幻影。")
+                else:
+                    yield event.plain_result(
+                        "用法：/幻影 <表图编号> <里图编号>；或先引用表图发送 /幻影，再引用里图发送 /幻影。"
+                    )
+                return
+
+            try:
+                image_path = await self._resolve_mirage_chat_image(media_items[0])
+            except GalleryError as exc:
+                yield event.plain_result(f"无法使用引用图片：{exc}")
+                return
+            pending = self._mirage_pending_covers.get(pending_key)
+            if not pending:
+                try:
+                    await self._remember_mirage_cover(pending_key, image_path)
+                except GalleryError as exc:
+                    yield event.plain_result(str(exc))
+                    return
+                yield event.plain_result("请指定里图。请引用里图图片并再次发送 /幻影。")
+                return
+
+            cover_path = Path(pending["path"])
+            try:
+                result = await self._generate_and_store_mirage(
+                    cover_path,
+                    image_path,
+                    "幻影坦克_引用生成.png",
+                )
+            except GalleryError as exc:
+                self._clear_mirage_pending_cover(pending_key)
+                yield event.plain_result(f"幻影坦克生成失败：{exc}")
+                return
+            except Exception as exc:
+                self._clear_mirage_pending_cover(pending_key)
+                logger.warning(f"聊天引用图片生成幻影坦克失败：{exc}")
+                yield event.plain_result("幻影坦克生成失败，请检查插件日志。")
+                return
+            self._clear_mirage_pending_cover(pending_key)
+
+        media_label = (
+            "成品已存在，使用图库中的重复项"
+            if result.get("duplicate")
+            else "已生成并保存"
+        )
+        saved_path = self.store.images_dir / result["filename"]
+        yield event.chain_result(
+            [
+                Plain(
+                    f"{media_label}到 NSFW「幻影坦克」分类（媒体编号 {result['id']}）。"
+                ),
+                Image.fromFileSystem(str(saved_path)),
+            ]
+        )
 
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.WEIXIN_OC
@@ -843,12 +1095,44 @@ class ImageLibraryPlugin(Star):
             return error_response(str(exc), status_code=400)
         return json_response(result)
 
+    async def web_mirage_source(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("图片参数格式无效。", status_code=400)
+        try:
+            result = await asyncio.to_thread(
+                self.store.get_mirage_source,
+                payload.get("image_id", 0),
+            )
+        except (GalleryError, TypeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(result)
+
+    async def web_mirage_settings(self):
+        return json_response(
+            await asyncio.to_thread(self.store.get_mirage_settings)
+        )
+
+    async def web_save_mirage_settings(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("幻影坦克参数格式无效。", status_code=400)
+        try:
+            settings = await asyncio.to_thread(
+                self.store.save_mirage_settings,
+                payload,
+            )
+        except GalleryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response(settings)
+
     async def web_images(self):
         category_id = str(request.query.get("category_id", ""))
         try:
             page = request.query.get("page", 1, type=int)
             page_size = request.query.get("page_size", 30, type=int)
             tag = str(request.query.get("tag", ""))[:32]
+            media_type = str(request.query.get("media_type", "")).strip().lower()
             data = await asyncio.to_thread(
                 self.store.list_images,
                 category_id,
@@ -856,6 +1140,7 @@ class ImageLibraryPlugin(Star):
                 page_size,
                 tag,
                 defer_video_thumbnails=True,
+                media_type=media_type,
             )
         except (GalleryError, TypeError, ValueError) as exc:
             return error_response(str(exc), status_code=400)
