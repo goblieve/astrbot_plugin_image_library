@@ -16,23 +16,71 @@ function clampByte(value) {
     : floor;
 }
 
-/**
- * Combine aligned ImageData into a transparent phantom-tank image.
- * This single-pass implementation keeps the same clamped intermediate values
- * while avoiding several full-size temporary pixel buffers.
- */
-export function processMiragePixels(innerImageData, coverImageData, options = {}) {
+function grayscaleByte(red, green, blue) {
+  // Match Pillow's RGB -> L fixed-point coefficients so server exports and
+  // browser previews use the same quantized luminance for alpha calculation.
+  return (red * 19595 + green * 38470 + blue * 7471 + 32768) >> 16;
+}
+
+export function prepareMiragePixelBuffers(width, height, innerData, coverData) {
+  const expectedLength = Number(width) * Number(height) * 4;
+  if (
+    !Number.isInteger(width)
+    || !Number.isInteger(height)
+    || width < 1
+    || height < 1
+    || innerData.length !== expectedLength
+    || coverData.length !== expectedLength
+  ) {
+    throw new Error("里图和表图像素数据尺寸无效。");
+  }
+
+  const innerBytes = innerData instanceof Uint8ClampedArray
+    ? innerData
+    : new Uint8ClampedArray(innerData);
+  const coverBytes = coverData instanceof Uint8ClampedArray
+    ? coverData
+    : new Uint8ClampedArray(coverData);
+  const pixelCount = width * height;
+  const innerGray = new Uint8ClampedArray(pixelCount);
+  const coverGray = new Uint8ClampedArray(pixelCount);
+  for (let pixel = 0, offset = 0; pixel < pixelCount; pixel += 1, offset += 4) {
+    innerGray[pixel] = grayscaleByte(
+      innerBytes[offset], innerBytes[offset + 1], innerBytes[offset + 2],
+    );
+    coverGray[pixel] = grayscaleByte(
+      coverBytes[offset], coverBytes[offset + 1], coverBytes[offset + 2],
+    );
+  }
+  return {
+    width,
+    height,
+    innerData: innerBytes,
+    coverData: coverBytes,
+    innerGray,
+    coverGray,
+  };
+}
+
+export function prepareMiragePixels(innerImageData, coverImageData) {
   if (
     innerImageData.width !== coverImageData.width
     || innerImageData.height !== coverImageData.height
   ) {
     throw new Error("里图和表图尺寸不一致。");
   }
+  return prepareMiragePixelBuffers(
+    innerImageData.width,
+    innerImageData.height,
+    innerImageData.data,
+    coverImageData.data,
+  );
+}
 
-  const width = innerImageData.width;
-  const height = innerImageData.height;
-  const innerData = innerImageData.data;
-  const coverData = coverImageData.data;
+export function processPreparedMiragePixels(prepared, options = {}) {
+  const {
+    width, height, innerData, coverData, innerGray, coverGray,
+  } = prepared;
   const output = new Uint8ClampedArray(innerData.length);
   const scaleInner = clamp01(options.scaleInner);
   const scaleCover = 1 - clamp01(options.scaleCover);
@@ -41,17 +89,9 @@ export function processMiragePixels(innerImageData, coverImageData, options = {}
   const weightInner = clamp01(options.weightInner);
   const colored = options.colored !== false;
 
-  for (let offset = 0; offset < output.length; offset += 4) {
-    const innerRed = innerData[offset];
-    const innerGreen = innerData[offset + 1];
-    const innerBlue = innerData[offset + 2];
-    const coverRed = coverData[offset];
-    const coverGreen = coverData[offset + 1];
-    const coverBlue = coverData[offset + 2];
-    const innerGray = clampByte(0.299 * innerRed + 0.587 * innerGreen + 0.114 * innerBlue);
-    const coverGray = clampByte(0.299 * coverRed + 0.587 * coverGreen + 0.114 * coverBlue);
-    const innerLuminance = innerGray * scaleInner;
-    const coverLuminance = 255 - (255 - coverGray) * scaleCover;
+  for (let pixel = 0, offset = 0; pixel < innerGray.length; pixel += 1, offset += 4) {
+    const innerLuminance = innerGray[pixel] * scaleInner;
+    const coverLuminance = 255 - (255 - coverGray[pixel]) * scaleCover;
     const alphaByte = Math.min(
       255,
       Math.max(255 + innerLuminance - coverLuminance, 0),
@@ -94,6 +134,11 @@ export function processMiragePixels(innerImageData, coverImageData, options = {}
   return new ImageData(output, width, height);
 }
 
+export function processMiragePixels(innerImageData, coverImageData, options = {}) {
+  const prepared = prepareMiragePixels(innerImageData, coverImageData);
+  return processPreparedMiragePixels(prepared, options);
+}
+
 function canvasFor(image, width, height, draw) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
@@ -106,12 +151,11 @@ function canvasFor(image, width, height, draw) {
   return context.getImageData(0, 0, width, height);
 }
 
-/** Resize the inner image, center-crop the cover image, then process both pixel buffers. */
-export function renderMirage(innerImage, coverImage, options = {}) {
+export function prepareMirageSources(innerImage, coverImage, maxSize = 1200) {
   if (!innerImage?.naturalWidth || !coverImage?.naturalWidth) {
     throw new Error("请先载入里图和表图。");
   }
-  const maxSize = Math.max(240, Math.min(1200, Math.round(Number(options.maxSize) || 1200)));
+  maxSize = Math.max(240, Math.min(1200, Math.round(Number(maxSize) || 1200)));
   let width;
   let height;
   if (coverImage.naturalWidth > coverImage.naturalHeight) {
@@ -122,7 +166,6 @@ export function renderMirage(innerImage, coverImage, options = {}) {
     width = Math.max(1, Math.ceil(coverImage.naturalWidth * maxSize / coverImage.naturalHeight));
   }
 
-  // The inner image is revealed on black, while the cover image is revealed on white.
   const innerData = canvasFor(innerImage, width, height, (context, image) => {
     const sourceRatio = image.naturalWidth / image.naturalHeight;
     const targetRatio = width / height;
@@ -142,5 +185,22 @@ export function renderMirage(innerImage, coverImage, options = {}) {
   const coverData = canvasFor(coverImage, width, height, (context, image) => {
     context.drawImage(image, 0, 0, width, height);
   });
-  return processMiragePixels(innerData, coverData, options);
+  return {
+    width,
+    height,
+    innerData: innerData.data,
+    coverData: coverData.data,
+  };
+}
+
+export function renderMirage(innerImage, coverImage, options = {}) {
+  const maxSize = Math.max(240, Math.min(1200, Math.round(Number(options.maxSize) || 1200)));
+  const sources = prepareMirageSources(innerImage, coverImage, maxSize);
+  const prepared = prepareMiragePixelBuffers(
+    sources.width,
+    sources.height,
+    sources.innerData,
+    sources.coverData,
+  );
+  return processPreparedMiragePixels(prepared, options);
 }

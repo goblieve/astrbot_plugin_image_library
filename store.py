@@ -45,6 +45,7 @@ FORMAT_SUFFIXES = {
     "BMP": ".bmp",
 }
 MAX_IMAGE_PIXELS = 160_000_000
+MAX_MIRAGE_OUTPUT_EDGE = 8192
 MAX_IMAGE_DECODE_PIXELS = 40_000_000
 MAX_ANIMATED_IMAGE_PIXELS = 40_000_000
 PAGE_SIZE_MAX = 60
@@ -1907,6 +1908,7 @@ class GalleryStore:
                 "id": int(row["id"]),
                 "category_id": row["category_id"],
                 "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
                 "filename": row["filename"],
                 "sha256": row["sha256"],
                 "size_bytes": int(row["size_bytes"]),
@@ -2100,6 +2102,7 @@ class GalleryStore:
                 "id": int(row["id"]),
                 "category_id": row["category_id"],
                 "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
                 "media_type": row["media_type"],
                 "image_format": row["image_format"],
                 "width": int(row["width"]),
@@ -2293,7 +2296,7 @@ class GalleryStore:
         return normalized
 
     def get_mirage_chat_sources(
-        self, cover_id: int, inner_id: int, *, allow_nsfw: bool = False
+        self, cover_id: int, inner_id: int, *, allow_nsfw: bool = False, allow_pending: bool = False
     ) -> dict:
         """Validate two confirmed gallery image sources for chat generation."""
         try:
@@ -2325,7 +2328,7 @@ class GalleryStore:
             role_name = "表图" if role == "cover" else "里图"
             if row["media_type"] != "image":
                 raise GalleryError(f"{role_name}编号 {image_id} 是视频；幻影坦克只支持图片。")
-            if row["category_id"] == "pending":
+            if row["category_id"] == "pending" and not allow_pending:
                 raise GalleryError("待处理分类尚未确认安全范围，不能用于聊天生成；请先将来源图片移入普通分类。")
             if (row["is_nsfw"] or row["category_nsfw"]) and not allow_nsfw:
                 raise GalleryError("该来源属于 NSFW 媒体；请使用有 NSFW 权限的管理员账号。")
@@ -2337,6 +2340,7 @@ class GalleryStore:
                 "path": media_path,
                 "category_id": row["category_id"],
                 "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
             }
         return result
 
@@ -2360,7 +2364,7 @@ class GalleryStore:
                         source.seek(0)
                     except EOFError:
                         pass
-                    if source_pixels > max_size * max_size * 4:
+                    if source_pixels > MAX_IMAGE_DECODE_PIXELS:
                         if image_format == "JPEG":
                             source.draft("RGB", (max_size, max_size))
                             if source.width * source.height > MAX_IMAGE_DECODE_PIXELS:
@@ -2402,48 +2406,12 @@ class GalleryStore:
             settings,
         )
 
-    def create_mirage_png_from_paths(
-        self,
-        cover_path: str | Path,
-        inner_path: str | Path,
-        output_path: str | Path,
-        settings: dict | None = None,
-    ) -> dict:
-        """Render a transparent phantom-tank PNG from local image files."""
-        cover_path = Path(cover_path)
-        inner_path = Path(inner_path)
-        for source_path in (cover_path, inner_path):
-            if not source_path.is_file():
-                raise GalleryError("找不到表图或里图文件。")
-            try:
-                source_bytes = source_path.stat().st_size
-            except OSError as exc:
-                raise GalleryError("表图或里图文件无法读取。") from exc
-            if source_bytes > self.max_source_image_bytes:
-                limit_mb = self.max_source_image_bytes // (1024 * 1024)
-                raise GalleryError(f"单张来源图片不能超过接收上限 {limit_mb} MB。")
-
-        options = self._normalize_mirage_settings(
-            settings if isinstance(settings, dict) else self.get_mirage_settings()
-        )
-        max_size = options["maxSize"]
-        inner_source = self._load_mirage_generation_frame(inner_path, max_size)
-        cover_source = self._load_mirage_generation_frame(cover_path, max_size)
-
-        if cover_source.width >= cover_source.height:
-            width = max_size
-            height = max(1, math.ceil(cover_source.height * max_size / cover_source.width))
-        else:
-            height = max_size
-            width = max(1, math.ceil(cover_source.width * max_size / cover_source.height))
-        # Inner pixels are revealed on black; cover pixels are revealed on white.
-        inner = ImageOps.fit(
-            inner_source,
-            (width, height),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
-        )
-        cover = cover_source.resize((width, height), Image.Resampling.LANCZOS)
+    @staticmethod
+    def _process_mirage_images(
+        inner: Image.Image,
+        cover: Image.Image,
+        options: dict,
+    ) -> Image.Image:
         inner_gray = inner.convert("L")
         cover_gray = cover.convert("L")
         scale_inner = options["scaleInner"]
@@ -2477,7 +2445,8 @@ class GalleryStore:
                     evaluate(
                         lambda args: args["convert"](
                             args["float"](args["channel"]) * scale_inner * (1.0 - desat_inner)
-                            + args["float"](args["gray"]) * scale_inner * desat_inner,
+                            + args["float"](args["gray"]) * scale_inner * desat_inner
+                            + 0.5,
                             "L",
                         ),
                         channel=inner_channel,
@@ -2494,7 +2463,8 @@ class GalleryStore:
                             + (
                                 255.0
                                 - (255.0 - args["float"](args["gray"])) * scale_cover
-                            ) * desat_cover,
+                            ) * desat_cover
+                            + 0.5,
                             "L",
                         ),
                         channel=cover_channel,
@@ -2530,7 +2500,7 @@ class GalleryStore:
                                     0.0,
                                 ),
                                 255.0,
-                            ),
+                            ) + 0.5,
                             "L",
                         ),
                         inner=inner_channel,
@@ -2540,7 +2510,7 @@ class GalleryStore:
                     )
                 )
             alpha = evaluate(
-                lambda args: args["convert"](args["alpha"], "L"),
+                lambda args: args["convert"](args["alpha"] + 0.5, "L"),
                 alpha=alpha_float,
             )
             result = Image.merge("RGBA", (*output_channels, alpha))
@@ -2565,52 +2535,120 @@ class GalleryStore:
                 inner_luminance=inner_luminance,
                 cover_luminance=cover_luminance,
             )
-            denominator = evaluate(
-                lambda args: args["max"](
-                    args["alpha"] / 255.0,
-                    1.0 / 255.0,
-                ),
-                alpha=alpha_float,
-            )
             luminance = evaluate(
                 lambda args: args["convert"](
                     args["min"](
                         args["max"](
-                            args["inner_luminance"] * 255.0 / args["denominator"],
+                            args["inner_luminance"] * 255.0 / args["alpha"],
                             0.0,
                         ),
                         255.0,
-                    ),
+                    ) + 0.5,
                     "L",
                 ),
                 inner_luminance=inner_luminance,
-                denominator=denominator,
+                alpha=alpha_float,
             )
             alpha = evaluate(
-                lambda args: args["convert"](args["alpha"], "L"),
+                lambda args: args["convert"](args["alpha"] + 0.5, "L"),
                 alpha=alpha_float,
             )
             result = Image.merge("RGBA", (luminance, luminance, luminance, alpha))
 
+        return result
+
+    def create_mirage_png_from_paths(
+        self,
+        cover_path: str | Path,
+        inner_path: str | Path,
+        output_path: str | Path,
+        settings: dict | None = None,
+    ) -> dict:
+        """Render a source-resolution transparent PNG without upscaling either crop."""
+        cover_path = Path(cover_path)
+        inner_path = Path(inner_path)
+        for source_path in (cover_path, inner_path):
+            if not source_path.is_file():
+                raise GalleryError("找不到表图或里图文件。")
+            try:
+                source_bytes = source_path.stat().st_size
+            except OSError as exc:
+                raise GalleryError("表图或里图文件无法读取。") from exc
+            if source_bytes > self.max_source_image_bytes:
+                limit_mb = self.max_source_image_bytes // (1024 * 1024)
+                raise GalleryError(f"单张来源图片不能超过接收上限 {limit_mb} MB。")
+
+        options = self._normalize_mirage_settings(
+            settings if isinstance(settings, dict) else self.get_mirage_settings()
+        )
+        inner_source = self._load_mirage_generation_frame(
+            inner_path, MAX_MIRAGE_OUTPUT_EDGE
+        )
+        cover_source = self._load_mirage_generation_frame(
+            cover_path, MAX_MIRAGE_OUTPUT_EDGE
+        )
+        cover_ratio = cover_source.width / cover_source.height
+        inner_ratio = inner_source.width / inner_source.height
+        if inner_ratio < cover_ratio:
+            inner_crop_width = float(inner_source.width)
+            inner_crop_height = inner_crop_width / cover_ratio
+        else:
+            inner_crop_height = float(inner_source.height)
+            inner_crop_width = inner_crop_height * cover_ratio
+
+        scale = min(
+            1.0,
+            inner_crop_width / cover_source.width,
+            inner_crop_height / cover_source.height,
+            MAX_MIRAGE_OUTPUT_EDGE / max(cover_source.width, cover_source.height),
+            math.sqrt(
+                MAX_IMAGE_DECODE_PIXELS
+                / (cover_source.width * cover_source.height)
+            ),
+        )
+        base_width = max(1, math.floor(cover_source.width * scale))
+        base_height = max(1, math.floor(cover_source.height * scale))
+        if base_width > inner_crop_width or base_height > inner_crop_height:
+            extra_scale = min(
+                inner_crop_width / base_width,
+                inner_crop_height / base_height,
+            )
+            base_width = max(1, math.floor(base_width * extra_scale))
+            base_height = max(1, math.floor(base_height * extra_scale))
+
         output_path = Path(output_path)
-        try:
-            result.save(output_path, format="PNG", compress_level=6)
-            size_bytes = output_path.stat().st_size
-        except Exception as exc:
-            raise GalleryError("幻影坦克 PNG 写入失败。") from exc
-        if size_bytes > self.max_image_bytes:
+        output_scale = 1.0
+        for _attempt in range(10):
+            width = max(1, math.floor(base_width * output_scale))
+            height = max(1, math.floor(base_height * output_scale))
+            inner = ImageOps.fit(
+                inner_source,
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            cover = cover_source.resize((width, height), Image.Resampling.LANCZOS)
+            result = self._process_mirage_images(inner, cover, options)
+            try:
+                result.save(output_path, format="PNG", compress_level=6)
+                size_bytes = output_path.stat().st_size
+            except Exception as exc:
+                raise GalleryError("幻影坦克 PNG 写入失败。") from exc
+            if size_bytes <= self.max_image_bytes:
+                return {"width": width, "height": height, "size_bytes": size_bytes}
             try:
                 output_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            actual_mb = size_bytes / (1024 * 1024)
-            limit_mb = self.max_image_bytes / (1024 * 1024)
-            raise GalleryError(
-                f"生成 PNG 为 {actual_mb:.1f} MB，超过图片入库上限 {limit_mb:.1f} MB；"
-                "请在管理页调低输出最长边后重试。"
+            output_scale *= max(
+                0.4,
+                min(0.9, math.sqrt(self.max_image_bytes / size_bytes) * 0.92),
             )
-        return {"width": width, "height": height, "size_bytes": size_bytes}
+            del result, inner, cover
 
+        raise GalleryError(
+            "幻影坦克成品无法在保持透明 PNG 的前提下压入图片体积上限。"
+        )
     def get_mirage_source(self, image_id: int, max_edge: int = 1200) -> dict:
         """Return a bounded, orientation-corrected preview for phantom-tank creation."""
         try:
@@ -2649,6 +2687,7 @@ class GalleryStore:
                 "id": row["id"],
                 "category_id": row["category_id"],
                 "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
                 "width": row["width"],
                 "height": row["height"],
                 "preview_width": preview_width,
@@ -2946,12 +2985,29 @@ class GalleryStore:
                 ),
             )
 
+    def embedding_scope_for_media(self, image_id: int) -> str | None:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                """SELECT i.is_nsfw, c.is_nsfw AS category_nsfw, c.id AS category_id
+                   FROM images i JOIN categories c ON c.id = i.category_id
+                   WHERE i.id = ?""",
+                (int(image_id),),
+            ).fetchone()
+        if not row:
+            raise GalleryError("找不到该媒体。")
+        is_nsfw = bool(row["is_nsfw"] or row["category_nsfw"])
+        return (
+            "nsfw"
+            if is_nsfw
+            else (None if row["category_id"] == "pending" else "sfw")
+        )
+
     def embedding_text_for_media(self, image_id: int, scope: str) -> str:
         if scope not in {"sfw", "nsfw"}:
             raise GalleryError("语义索引范围无效。")
         with self._lock, self._connect() as db:
             row = db.execute(
-                """SELECT i.ai_description, i.description_override, i.ai_tags,
+                """SELECT i.ai_description, i.description_override, i.ai_tags, i.manual_tags,
                           i.is_nsfw, c.is_nsfw AS category_nsfw, c.id AS category_id
                    FROM images i JOIN categories c ON c.id = i.category_id
                    WHERE i.id = ?""",
@@ -2963,10 +3019,12 @@ class GalleryStore:
         if (scope == "nsfw") != is_nsfw or (scope == "sfw" and row["category_id"] == "pending"):
             raise GalleryError("媒体的安全范围已变化，无法建立该语义索引。")
         description = str(row["description_override"] or row["ai_description"] or "").strip()
-        tags = self._decode_tags(row["ai_tags"])
+        tags = self.normalize_tags(
+            self._decode_tags(row["ai_tags"]) + self._decode_tags(row["manual_tags"])
+        )
         searchable_text = "\n".join(part for part in (description, " ".join(tags)) if part)
         if not searchable_text:
-            raise GalleryError("媒体还没有可用于语义索引的描述或 AI 标签。")
+            raise GalleryError("媒体还没有可用于语义索引的描述或标签。")
         return searchable_text
 
     def embedding_rebuild_candidates(self, scope: str) -> list[dict]:
@@ -2979,7 +3037,7 @@ class GalleryStore:
         )
         with self._lock, self._connect() as db:
             rows = db.execute(
-                f"""SELECT i.id, i.ai_description, i.description_override, i.ai_tags
+                f"""SELECT i.id, i.ai_description, i.description_override, i.ai_tags, i.manual_tags
                     FROM images i JOIN categories c ON c.id = i.category_id
                     WHERE {safety_filter}
                     ORDER BY i.id"""
@@ -2987,7 +3045,9 @@ class GalleryStore:
         candidates = []
         for row in rows:
             description = str(row["description_override"] or row["ai_description"] or "").strip()
-            tags = self._decode_tags(row["ai_tags"])
+            tags = self.normalize_tags(
+                self._decode_tags(row["ai_tags"]) + self._decode_tags(row["manual_tags"])
+            )
             searchable_text = "\n".join(part for part in (description, " ".join(tags)) if part)
             if searchable_text:
                 candidates.append(
@@ -3065,6 +3125,7 @@ class GalleryStore:
                     "id": row["id"],
                     "category_id": row["category_id"],
                     "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
                     "filename": row["filename"],
                     "size_bytes": row["size_bytes"],
                     "width": row["width"],
@@ -3129,6 +3190,11 @@ class GalleryStore:
                     new_tags,
                     self._decode_tags(row["ai_tags"]),
                 )
+                if new_tags != old_tags:
+                    db.execute(
+                        "DELETE FROM media_embeddings WHERE image_id = ?",
+                        (row["id"],),
+                    )
                 updated += 1
         return updated
 
@@ -3780,6 +3846,7 @@ class GalleryStore:
                     "id": row["original_id"],
                     "category_id": row["category_id"],
                     "category_name": row["category_name"],
+                "is_nsfw": bool(row["is_nsfw"] or row["category_nsfw"]),
                     "filename": row["filename"],
                     "size_bytes": row["size_bytes"],
                     "width": row["width"],

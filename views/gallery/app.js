@@ -1,4 +1,8 @@
-import { renderMirage } from "./mirage.js";
+import {
+  prepareMiragePixelBuffers,
+  prepareMirageSources,
+  processPreparedMiragePixels,
+} from "./mirage.js";
 
 const bridge = window.AstrBotPluginView;
 const PAGE_SIZE = 30;
@@ -6,6 +10,7 @@ const PAGE_SIZE = 30;
 const els = {
   notice: document.querySelector("#notice"),
   openTaskCenter: document.querySelector("#openTaskCenterButton"),
+  refreshButton: document.querySelector("#refreshButton"),
   openMirage: document.querySelector("#openMirageButton"),
   mirageModal: document.querySelector("#mirageModal"),
   closeMirage: document.querySelector("#closeMirageButton"),
@@ -217,6 +222,14 @@ const state = {
   taskCenterOpen: false,
   taskCenterSeenFailedIds: new Set(),
   mirageSources: { inner: null, cover: null },
+  miragePreparedKey: "",
+  miragePreparedPixels: null,
+  mirageFallbackPrepared: null,
+  mirageWorker: null,
+  mirageWorkerPreparedKey: "",
+  mirageWorkerRequestId: 0,
+  mirageWorkerPending: new Map(),
+  mirageRenderRequestId: 0,
   mirageOutputReady: false,
   mirageOutputNsfw: false,
   mirageMaxImageBytes: 0,
@@ -1735,9 +1748,126 @@ function renderMirageCategories() {
   els.mirageSave.disabled = !state.mirageOutputReady || !preferred;
 }
 
+function ensureMirageWorker() {
+  if (state.mirageWorker) return state.mirageWorker;
+  if (typeof Worker === "undefined") return null;
+  try {
+    const worker = new Worker(new URL("./mirage-worker.js", import.meta.url), {
+      type: "module",
+    });
+    worker.addEventListener("message", (event) => {
+      const response = event.data || {};
+      const pending = state.mirageWorkerPending.get(response.requestId);
+      if (!pending) return;
+      state.mirageWorkerPending.delete(response.requestId);
+      if (response.ok) pending.resolve(response);
+      else pending.reject(new Error(response.error || "预览计算失败。"));
+    });
+    worker.addEventListener("error", (event) => {
+      const error = new Error(event.message || "浏览器后台像素处理不可用。");
+      if (state.mirageWorker === worker) {
+        state.mirageWorker = null;
+        state.mirageWorkerPreparedKey = "";
+      }
+      for (const pending of state.mirageWorkerPending.values()) {
+        pending.reject(error);
+      }
+      state.mirageWorkerPending.clear();
+    });
+    state.mirageWorker = worker;
+    return worker;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function requestMirageWorker(type, payload, transfer = []) {
+  const worker = ensureMirageWorker();
+  if (!worker) return Promise.reject(new Error("浏览器后台像素处理不可用。"));
+  const requestId = ++state.mirageWorkerRequestId;
+  return new Promise((resolve, reject) => {
+    state.mirageWorkerPending.set(requestId, { resolve, reject });
+    try {
+      worker.postMessage({ requestId, type, ...payload }, transfer);
+    } catch (error) {
+      state.mirageWorkerPending.delete(requestId);
+      reject(error);
+    }
+  });
+}
+
+function stopMirageWorker(error) {
+  const worker = state.mirageWorker;
+  state.mirageWorker = null;
+  state.mirageWorkerPreparedKey = "";
+  if (worker) worker.terminate();
+  for (const pending of state.mirageWorkerPending.values()) {
+    pending.reject(error);
+  }
+  state.mirageWorkerPending.clear();
+}
+
+async function renderMiragePixels(inner, cover, options) {
+  const previewSize = Number(els.mirageMaxSize.value) || 1200;
+  const sourceKey = String(inner.id) + ":" + String(cover.id) + ":" + String(previewSize);
+  if (state.miragePreparedKey !== sourceKey || !state.miragePreparedPixels) {
+    state.miragePreparedPixels = prepareMirageSources(
+      inner.image,
+      cover.image,
+      previewSize,
+    );
+    state.mirageFallbackPrepared = null;
+    state.miragePreparedKey = sourceKey;
+    state.mirageWorkerPreparedKey = "";
+  }
+
+  const worker = ensureMirageWorker();
+  if (worker) {
+    try {
+      if (state.mirageWorkerPreparedKey !== sourceKey) {
+        const innerBuffer = state.miragePreparedPixels.innerData.slice().buffer;
+        const coverBuffer = state.miragePreparedPixels.coverData.slice().buffer;
+        await requestMirageWorker(
+          "prepare",
+          {
+            width: state.miragePreparedPixels.width,
+            height: state.miragePreparedPixels.height,
+            innerBuffer,
+            coverBuffer,
+          },
+          [innerBuffer, coverBuffer],
+        );
+        state.mirageWorkerPreparedKey = sourceKey;
+      }
+      const result = await requestMirageWorker("render", { options });
+      return new ImageData(
+        new Uint8ClampedArray(result.pixelBuffer),
+        result.width,
+        result.height,
+      );
+    } catch (error) {
+      stopMirageWorker(error);
+    }
+  }
+  if (!state.mirageFallbackPrepared) {
+    state.mirageFallbackPrepared = prepareMiragePixelBuffers(
+      state.miragePreparedPixels.width,
+      state.miragePreparedPixels.height,
+      state.miragePreparedPixels.innerData,
+      state.miragePreparedPixels.coverData,
+    );
+  }
+  return processPreparedMiragePixels(state.mirageFallbackPrepared, options);
+}
+
 function clearMirageOutput() {
+  state.mirageRenderRequestId += 1;
   state.mirageOutputReady = false;
   state.mirageOutputNsfw = false;
+  state.miragePreparedKey = "";
+  state.miragePreparedPixels = null;
+  state.mirageFallbackPrepared = null;
+  state.mirageWorkerPreparedKey = "";
   for (const canvas of [els.mirageWhiteCanvas, els.mirageBlackCanvas, els.mirageRawCanvas]) {
     canvas.width = 0;
     canvas.height = 0;
@@ -1746,7 +1876,7 @@ function clearMirageOutput() {
   els.mirageSave.disabled = true;
 }
 
-function renderMirageOutput() {
+async function renderMirageOutput() {
   const inner = state.mirageSources.inner;
   const cover = state.mirageSources.cover;
   if (!inner || !cover) {
@@ -1754,8 +1884,10 @@ function renderMirageOutput() {
     return;
   }
 
+  const requestId = ++state.mirageRenderRequestId;
   try {
-    const imageData = renderMirage(inner.image, cover.image, mirageOptions());
+    const imageData = await renderMiragePixels(inner, cover, mirageOptions());
+    if (requestId !== state.mirageRenderRequestId) return;
     els.mirageRawCanvas.width = imageData.width;
     els.mirageRawCanvas.height = imageData.height;
     const rawContext = els.mirageRawCanvas.getContext("2d");
@@ -1778,21 +1910,21 @@ function renderMirageOutput() {
     state.mirageOutputReady = true;
     state.mirageOutputNsfw = Boolean(inner.is_nsfw || cover.is_nsfw);
     els.mirageOutputMeta.textContent = imageData.width + " × " + imageData.height
-      + " · 透明 PNG · " + (state.mirageOutputNsfw ? "NSFW 来源" : "SFW 来源");
+      + " · 透明 PNG 预览 · " + (state.mirageOutputNsfw ? "NSFW 来源" : "SFW 来源");
     renderMirageCategories();
     if (state.mirageOutputNsfw && els.mirageCategory.disabled) {
-      setMirageStatus("来源含 NSFW 标记，但当前没有可保存的 NSFW 分类。请先创建或恢复 NSFW 分类。", true);
+      setMirageStatus("来源含 NSFW 媒体，但当前没有可保存的 NSFW 分类。请先创建或恢复一个 NSFW 分类。", true);
     } else if (state.mirageOutputNsfw) {
-      setMirageStatus("来源含 NSFW 标记，成品分类已限制为 NSFW。");
+      setMirageStatus("预览已更新。成品导出时会从图库原图重新生成。");
     } else {
-      setMirageStatus("预览已更新。保存前请分别检查白底和黑底效果。");
+      setMirageStatus("预览已更新。保存时会从图库原图按有效分辨率生成成品。");
     }
   } catch (error) {
+    if (requestId !== state.mirageRenderRequestId) return;
     clearMirageOutput();
     setMirageStatus(error.message || "生成预览失败。", true);
   }
 }
-
 function setMirageSettingsStatus(message, isError = false) {
   els.mirageSettingsStatus.textContent = message;
   els.mirageSettingsStatus.classList.toggle("error", isError);
@@ -2125,7 +2257,7 @@ async function loadMirageSources() {
     renderMirageSourceCards();
     const maxMb = (state.mirageMaxImageBytes / (1024 * 1024)).toFixed(1);
     els.mirageSizeHint.textContent = "当前图片入库上限为 " + maxMb
-      + " MB。超出时请降低输出最长边后重新预览；为保留透明像素，不会对成品再做有损压缩。";
+      + " MB；成品由服务端从图库原图生成，按裁切后的较低有效分辨率输出；超过体积上限时会自动缩小并保留透明通道。";
     renderMirageOutput();
   } catch (error) {
     if (requestId !== state.mirageSourceRequestId) return;
@@ -2220,15 +2352,6 @@ async function swapMirageImages() {
   setMirageStatus("里图和表图已互换，预览已更新。");
 }
 
-function canvasToBlob(canvas) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob);
-      else reject(new Error("浏览器无法导出透明 PNG。"));
-    }, "image/png");
-  });
-}
-
 async function saveMirageToGallery() {
   const category = state.categories.find((item) => item.id === els.mirageCategory.value);
   if (!state.mirageOutputReady || !category) {
@@ -2242,24 +2365,17 @@ async function saveMirageToGallery() {
   }
 
   els.mirageSave.disabled = true;
-  setMirageStatus("正在导出透明 PNG…");
+  setMirageStatus("正在从图库原图生成透明 PNG…");
   try {
     await saveMirageSettingsNow();
-    const blob = await canvasToBlob(els.mirageRawCanvas);
-    if (state.mirageMaxImageBytes > 0 && blob.size > state.mirageMaxImageBytes) {
-      const limit = formatBytes(state.mirageMaxImageBytes);
-      throw new Error("生成 PNG 为 " + formatBytes(blob.size) + "，超过当前入库上限 "
-        + limit + "。请降低输出最长边后重新预览。");
-    }
     const innerId = state.mirageSources.inner.id;
     const coverId = state.mirageSources.cover.id;
-    const file = new File(
-      [blob],
-      "mirage-" + innerId + "-" + coverId + ".png",
-      { type: "image/png" },
-    );
-    setMirageStatus("正在将 PNG 保存到「" + category.name + "」…");
-    const result = await uploadOneMedia(file, category.id, 1, 1);
+    const result = await bridge.apiPost("mirage/save", {
+      cover_id: coverId,
+      inner_id: innerId,
+      category_id: category.id,
+      settings: mirageOptions(),
+    });
     closeMirageModal();
     state.trashMode = false;
     state.duplicateMode = false;
@@ -2277,13 +2393,16 @@ async function saveMirageToGallery() {
     try {
       await loadCategories(category.id);
     } catch (error) {
-      showNotice("成品已上传，但刷新图库失败：" + (error.message || "请手动刷新。"), "error", 0);
+      showNotice("成品已生成，但刷新图库失败：" + (error.message || "请手动刷新。"), "error", 0);
       return;
     }
+    const outputSize = result.mirage_width && result.mirage_height
+      ? "（" + result.mirage_width + " × " + result.mirage_height + "）"
+      : "";
     showNotice(
       result.duplicate
         ? "该幻影坦克图片已存在于「" + category.name + "」，跳过重复项。"
-        : "幻影坦克 PNG 已保存到「" + category.name + "」。",
+        : "幻影坦克 PNG 已保存到「" + category.name + "」" + outputSize + "。",
       "success",
     );
   } catch (error) {
@@ -2294,39 +2413,38 @@ async function saveMirageToGallery() {
     }
   }
 }
-
-document.querySelector("#refreshButton").addEventListener("click", refresh);
-els.openTaskCenter.addEventListener("click", openTaskCenter);
-els.openMirage.addEventListener("click", openMirageModal);
+els.openMirage.addEventListener("click", () => {
+  openMirageModal().catch((error) => {
+    setMirageStatus(error.message || "打开幻影坦克制作失败。", true);
+  });
+});
 els.closeMirage.addEventListener("click", closeMirageModal);
-els.useSelectedMirage.addEventListener("click", useSelectedMirageImages);
-els.loadMirageSources.addEventListener("click", loadMirageSources);
-els.swapMirage.addEventListener("click", swapMirageImages);
-els.mirageInnerPickerCategory.addEventListener("change", () => loadMiragePicker("inner", 1));
-els.mirageCoverPickerCategory.addEventListener("change", () => loadMiragePicker("cover", 1));
-els.mirageInnerPickerPrevious.addEventListener("click", () => {
-  loadMiragePicker("inner", state.miragePicker.inner.page - 1);
-});
-els.mirageInnerPickerNext.addEventListener("click", () => {
-  loadMiragePicker("inner", state.miragePicker.inner.page + 1);
-});
-els.mirageCoverPickerPrevious.addEventListener("click", () => {
-  loadMiragePicker("cover", state.miragePicker.cover.page - 1);
-});
-els.mirageCoverPickerNext.addEventListener("click", () => {
-  loadMiragePicker("cover", state.miragePicker.cover.page + 1);
-});
-els.mirageInnerId.addEventListener("input", () => handleMirageIdInput("inner"));
-els.mirageCoverId.addEventListener("input", () => handleMirageIdInput("cover"));
-els.mirageInnerId.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") loadMirageSources();
-});
-els.mirageCoverId.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") loadMirageSources();
-});
 els.mirageModal.addEventListener("click", (event) => {
   if (event.target === els.mirageModal) closeMirageModal();
 });
+els.useSelectedMirage.addEventListener("click", () => {
+  useSelectedMirageImages().catch((error) => {
+    setMirageStatus(error.message || "读取已选图片失败。", true);
+  });
+});
+els.swapMirage.addEventListener("click", () => {
+  swapMirageImages().catch((error) => {
+    setMirageStatus(error.message || "交换图片失败。", true);
+  });
+});
+els.loadMirageSources.addEventListener("click", loadMirageSources);
+els.mirageInnerId.addEventListener("input", () => handleMirageIdInput("inner"));
+els.mirageCoverId.addEventListener("input", () => handleMirageIdInput("cover"));
+for (const which of ["inner", "cover"]) {
+  const picker = miragePickerElements(which);
+  picker.category.addEventListener("change", () => loadMiragePicker(which, 1));
+  picker.previous.addEventListener("click", () => {
+    loadMiragePicker(which, state.miragePicker[which].page - 1);
+  });
+  picker.next.addEventListener("click", () => {
+    loadMiragePicker(which, state.miragePicker[which].page + 1);
+  });
+}
 els.mirageSave.addEventListener("click", saveMirageToGallery);
 for (const input of [
   els.mirageMaxSize,
@@ -2342,6 +2460,8 @@ els.mirageColored.addEventListener("change", handleMirageColorChange);
 els.mirageCategory.addEventListener("change", () => {
   els.mirageSave.disabled = !state.mirageOutputReady || !els.mirageCategory.value;
 });
+els.openTaskCenter.addEventListener("click", openTaskCenter);
+els.refreshButton.addEventListener("click", refresh);
 els.closeTaskCenter.addEventListener("click", closeTaskCenter);
 els.refreshTasks.addEventListener("click", () => {
   loadTaskCenter().catch((error) => showNotice(error.message || "刷新任务失败。", "error", 0));
@@ -2482,7 +2602,8 @@ els.tagsForm.addEventListener("submit", async (event) => {
     closeTagsModal();
     state.selected.clear();
     await loadImages();
-    showNotice(`已更新 ${result.updated} 个媒体的手工标签。`);
+    const indexNotice = result.embedding_scheduled ? ` 已提交 ${result.embedding_scheduled} 项语义索引更新。` : "";
+    showNotice(`已更新 ${result.updated} 个媒体的手工标签。${indexNotice}`);
   } catch (error) {
     showNotice(error.message || "保存标签失败。", "error", 0);
   }

@@ -345,13 +345,13 @@
           <div class="mirage-section-heading">
             <div>
               <h3>像素参数</h3>
-              <p class="hint">预览会随参数即时更新；输出最长边限制为 1200 像素，以控制浏览器内存占用。</p>
+              <p class="hint">预览在浏览器内缩小以保持响应；成品由服务端从原图生成，维持表图比例并按两图裁切后的较低有效分辨率导出。</p>
               <p class="hint" id="mirageSettingsStatus">参数会自动保存到插件数据，下次打开继续使用。</p>
             </div>
           </div>
           <div class="mirage-controls">
             <label class="mirage-control">
-              <span>输出最长边</span>
+              <span>预览最长边</span>
               <output id="mirageMaxSizeValue" for="mirageMaxSizeInput">1200 px</output>
               <input id="mirageMaxSizeInput" type="range" min="240" max="1200" step="80" value="1200" />
             </label>
@@ -409,7 +409,7 @@
           </label>
           <button class="button primary" id="saveMirageButton" type="button" disabled>保存 PNG 到图库</button>
         </div>
-        <p class="hint mirage-size-hint" id="mirageSizeHint">超出图库入库体积上限时，请降低输出最长边后重新预览；为保留透明像素，不会对成品再做有损压缩。</p>
+        <p class="hint mirage-size-hint" id="mirageSizeHint">预览最长边只影响浏览器预览速度；成品由服务端按源图有效分辨率生成，若超过图库体积上限会自动缩小尺寸，并保留透明通道。</p>
         <canvas id="mirageRawCanvas" hidden></canvas>
       </section>
     </div>

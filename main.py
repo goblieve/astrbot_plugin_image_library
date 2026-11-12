@@ -92,6 +92,7 @@ class ImageLibraryPlugin(Star):
         self._ai_queued_ids: set[tuple[str, int]] = set()
         self._processing_tasks: dict[str, asyncio.Task] = {}
         self._processing_task_keys: dict[tuple[str, int], str] = {}
+        self._embedding_reschedule_requests: dict[tuple[str, int], tuple[str, str]] = {}
         self._embedding_semaphore = asyncio.Semaphore(1)
         self._video_preview_semaphore = asyncio.Semaphore(1)
         self._trash_cleanup_task: asyncio.Task | None = None
@@ -120,6 +121,7 @@ class ImageLibraryPlugin(Star):
             (f"/{PLUGIN_NAME}/mirage/source", self.web_mirage_source, ["POST"], "Load a library image for phantom-tank creation"),
             (f"/{PLUGIN_NAME}/mirage/settings", self.web_mirage_settings, ["GET"], "Read phantom-tank settings"),
             (f"/{PLUGIN_NAME}/mirage/settings/save", self.web_save_mirage_settings, ["POST"], "Save phantom-tank settings"),
+            (f"/{PLUGIN_NAME}/mirage/save", self.web_save_mirage, ["POST"], "Generate and store a phantom-tank image"),
             (f"/{PLUGIN_NAME}/images/delete", self.web_delete_images, ["POST"], "Move selected media to trash"),
             (f"/{PLUGIN_NAME}/trash", self.web_trash, ["GET"], "List trashed media"),
             (f"/{PLUGIN_NAME}/trash/restore", self.web_restore_trash, ["POST"], "Restore trashed media"),
@@ -243,8 +245,27 @@ class ImageLibraryPlugin(Star):
                     error="任务意外退出。",
                     message="任务意外退出，可从任务中心重试。",
                 )
+                row["status"] = "failed"
             except Exception:
                 pass
+        if processing_key and processing_key[0] == "semantic_index":
+            pending = self._embedding_reschedule_requests.pop(processing_key, None)
+            current_id = self._processing_task_keys.get(processing_key)
+            if (
+                pending
+                and current_id != task_id
+                and (not row or row.get("status") != "cancelled")
+            ):
+                try:
+                    self._schedule_embedding_task(
+                        processing_key[1],
+                        pending[0],
+                        pending[1],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"媒体 {processing_key[1]} 的语义索引自动补建失败：{exc}"
+                    )
 
     async def _run_ai_evaluation(
         self,
@@ -343,7 +364,10 @@ class ImageLibraryPlugin(Star):
         existing_id = self._processing_task_keys.get(key)
         existing = self._processing_tasks.get(existing_id or "")
         if existing_id and existing and not existing.done():
-            return None if batch_id else existing_id
+            if batch_id:
+                return None
+            self._embedding_reschedule_requests[key] = (scope, provider_id)
+            return existing_id
         task_id = self.store.create_processing_task(
             "semantic_index",
             media_id=int(image_id),
@@ -1113,6 +1137,67 @@ class ImageLibraryPlugin(Star):
             await asyncio.to_thread(self.store.get_mirage_settings)
         )
 
+    async def web_save_mirage(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("幻影坦克参数格式无效。", status_code=400)
+        try:
+            cover_id = int(payload.get("cover_id", 0))
+            inner_id = int(payload.get("inner_id", 0))
+            category_id = str(payload.get("category_id") or "").strip()
+            settings = payload.get("settings")
+            if cover_id <= 0 or inner_id <= 0 or not category_id:
+                raise ValueError("请提供有效的表图、里图和目标分类。")
+            if not isinstance(settings, dict):
+                raise ValueError("幻影坦克参数格式无效。")
+            sources = await asyncio.to_thread(
+                self.store.get_mirage_chat_sources,
+                cover_id,
+                inner_id,
+                allow_nsfw=True,
+                allow_pending=True,
+            )
+            category = await asyncio.to_thread(
+                self.store.category_by_id,
+                category_id,
+            )
+            if not category:
+                raise GalleryError("找不到目标分类。")
+            source_is_nsfw = bool(
+                sources["cover"]["is_nsfw"] or sources["inner"]["is_nsfw"]
+            )
+            if source_is_nsfw and not category.get("is_nsfw"):
+                raise GalleryError("NSFW 来源的成品只能保存到 NSFW 分类。")
+
+            output_path = self.store.staging_dir / f"{uuid.uuid4().hex}.png"
+            try:
+                dimensions = await asyncio.to_thread(
+                    self.store.create_mirage_png_from_paths,
+                    sources["cover"]["path"],
+                    sources["inner"]["path"],
+                    output_path,
+                    settings,
+                )
+                result = await self._ingest_media_with_tasks(
+                    output_path,
+                    category_id,
+                    "image",
+                    "web",
+                    display_name=f"幻影坦克_表图{cover_id}_里图{inner_id}.png",
+                )
+                result["mirage_width"] = dimensions["width"]
+                result["mirage_height"] = dimensions["height"]
+                return json_response(result)
+            finally:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except (TypeError, ValueError, GalleryError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            logger.warning(f"管理页幻影坦克生成失败：{exc}")
+            return error_response("幻影坦克生成失败，请检查插件日志。", status_code=500)
     async def web_save_mirage_settings(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
@@ -2254,7 +2339,29 @@ class ImageLibraryPlugin(Star):
             )
         except (TypeError, ValueError, GalleryError) as exc:
             return error_response(str(exc) or "媒体编号无效。", status_code=400)
-        return json_response({"updated": updated})
+        embedding_scheduled = 0
+        if self.embedding_provider_id:
+            for image_id in sorted(set(image_ids)):
+                try:
+                    scope = await asyncio.to_thread(
+                        self.store.embedding_scope_for_media, image_id
+                    )
+                    if not scope:
+                        continue
+                    await asyncio.to_thread(
+                        self.store.embedding_text_for_media, image_id, scope
+                    )
+                except GalleryError:
+                    continue
+                if self._schedule_embedding_task(
+                    image_id,
+                    scope,
+                    self.embedding_provider_id,
+                ):
+                    embedding_scheduled += 1
+        return json_response(
+            {"updated": updated, "embedding_scheduled": embedding_scheduled}
+        )
 
     async def web_update_media_details(self):
         payload = await request.json(default={})
@@ -2287,7 +2394,11 @@ class ImageLibraryPlugin(Star):
         scope = result["scope"]
         searchable_text = "\n".join(
             part
-            for part in (result["description"], " ".join(result["ai_tags"]))
+            for part in (
+                result["description"],
+                " ".join(result["ai_tags"]),
+                " ".join(result["manual_tags"]),
+            )
             if part
         )
         if scope and searchable_text and self.embedding_provider_id:
